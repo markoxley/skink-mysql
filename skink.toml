@@ -1,0 +1,18 @@
+# Skink Project Manifest (managed by scales)
+
+[package]
+name = "mysql"
+version = "0.1.0"
+author = "mark"
+entry = "mysql.skink"
+description = "MySQL/MariaDB driver for Skink: pure-Skink wire protocol (packets, lenenc), mysql_native_password + caching_sha2_password auth, COM_QUERY + prepared statements, TLS, and a dbx driver adapter"
+license = "Apache-2.0"
+
+[target]
+env = "std"
+no_std = false
+os = "any"
+arch = "any"
+
+[dependencies]
+"mod/markoxley/skink-dbx" = "0.1.0"

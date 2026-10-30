@@ -1,0 +1,1057 @@
+// File:    my_conn.skink
+// Purpose: MySQL/MariaDB connection — initial handshake, capability
+//          negotiation, authentication (mysql_native_password,
+//          caching_sha2_password incl. RSA-encrypted full auth),
+//          COM_QUERY, prepared statements (COM_STMT_PREPARE/EXECUTE/
+//          CLOSE) for bound parameters, transactions, and pings.
+//
+//          Text-protocol rows decode through the column type byte;
+//          prepared-statement results use the binary row protocol.
+//          '?' placeholders are native to prepared statements — no
+//          rewriting needed.
+module my_conn
+
+import "std/str"
+import "std/libc"
+import "std/errors"
+import "std/strconv"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "mod/markoxley/skink-dbx/dbx_value"
+
+import "my_pkt"
+import "my_type"
+
+// libcrypto primitives — explicit lengths so binary auth data is safe.
+extern fn SHA1(d: string, n: int64, md: string) -> string
+extern fn SHA256(d: string, n: int64, md: string) -> string
+extern fn BIO_new_mem_buf(b: string, len: int) -> int64
+extern fn PEM_read_bio_PUBKEY(bp: int64, x: int64, cb: int64, u: int64) -> int64
+extern fn EVP_PKEY_get1_RSA(pkey: int64) -> int64
+extern fn EVP_PKEY_free(pkey: int64) -> int
+extern fn RSA_public_encrypt(flen: int, src: string, to: string, rsa: int64, padding: int) -> int
+extern fn RSA_size(rsa: int64) -> int
+extern fn RSA_free(rsa: int64)
+extern fn BIO_free(b: int64) -> int
+
+// capability flags (subset)
+const CAP_LONG_PASSWORD   = 1
+const CAP_LONG_FLAG       = 4
+const CAP_CONNECT_WITH_DB = 8
+const CAP_PROTOCOL_41     = 512
+const CAP_SSL             = 2048
+const CAP_TRANSACTIONS    = 8192
+const CAP_SECURE_CONN     = 32768
+const CAP_MULTI_RESULTS   = 131072
+const CAP_PLUGIN_AUTH     = 524288
+
+// auth plugin names
+const AUTH_NATIVE = "mysql_native_password"
+const AUTH_SHA2   = "caching_sha2_password"
+
+// command bytes
+const COM_INIT_DB      = 2
+const COM_QUERY        = 3
+const COM_PING         = 14
+const COM_STMT_PREPARE = 22
+const COM_STMT_EXECUTE = 23
+const COM_STMT_CLOSE   = 25
+const COM_QUIT         = 1
+
+// packet markers
+const PKT_OK   = 0
+const PKT_ERR  = 255
+const PKT_EOF  = 254
+const PKT_AUTH_SWITCH = 254
+const PKT_MORE_DATA   = 1
+const PKT_LOCAL_INFILE = 251
+
+// ColDef is one parsed column definition.
+pub struct ColDef {
+    Name:    string
+    ColType: int
+    Flags:   int
+    Charset: int
+}
+
+// MyConn is one physical MySQL connection.
+pub struct MyConn {
+    Bc:          dbx_bufconn.BufConn
+    Seq:         int    // running packet sequence for the current exchange
+    ServerCaps:  int
+    PluginName:  string
+    ServerVer:   string
+    ConnID:      int64
+    Cols:        []ColDef // columns of the in-flight result set
+    ServerStatus: int
+}
+
+// ---- error / status packets ---------------------------------------------
+
+// parseErr decodes an ERR packet body (0xff already consumed by caller
+// via the payload's first byte).
+pub fn ParseErr(body: string, n: int) -> string {
+    r := my_pkt.NewReader(body, n)
+    first := my_pkt.RByte(&r)
+    if first != PKT_ERR {
+        return "mysql: not an error packet"
+    }
+    code := my_pkt.RI16(&r)
+    state := ""
+    msg := ""
+    if my_pkt.Remaining(&r) > 0 && r.Body[r.Pos] == 35 { // '#'
+        my_pkt.RByte(&r)
+        st := libc.malloc(6)
+        libc.memcpy(st, string(int64(r.Body) + int64(r.Pos)), 5)
+        st[5] = 0
+        r.Pos = r.Pos + 5
+        state = st
+        m, mn := my_pkt.RRest(&r)
+        msg = str.Substr(m, 0, mn)
+    } else {
+        m, mn := my_pkt.RRest(&r)
+        msg = str.Substr(m, 0, mn)
+    }
+    return str.Concat("mysql: ", str.Concat(itoa(code), str.Concat(" ", str.Concat(state, str.Concat(" ", msg)))))
+}
+
+// itoa — local decimal helper (avoids strconv for codes).
+fn itoa(v: int) -> string {
+    buf := libc.malloc(12)
+    i := 11
+    n := v
+    buf[i] = 0
+    for {
+        i = i - 1
+        buf[i] = 48 + (n % 10)
+        n = n / 10
+        if n == 0 {
+            break
+        }
+    }
+    return string(int64(buf) + int64(i))
+}
+
+// isErr checks a packet body for the ERR marker.
+fn isErr(body: string, n: int) -> bool {
+    return n > 0 && body[0] == PKT_ERR
+}
+
+// isEOF: an EOF/OK terminator is 0xfe (or 0x00 with deprecate-eof —
+// we do NOT set that capability, so terminators are 0xfe packets < 9B).
+fn isEOF(body: string, n: int) -> bool {
+    return n < 9 && n > 0 && body[0] == PKT_EOF
+}
+
+// parseOK extracts affected rows and insert id from an OK packet.
+fn parseOK(body: string, n: int) -> (int64, int64, int) {
+    r := my_pkt.NewReader(body, n)
+    my_pkt.RByte(&r) // 0x00
+    aff, _ := my_pkt.RLenenc(&r)
+    last, _ := my_pkt.RLenenc(&r)
+    status := 0
+    if my_pkt.Remaining(&r) >= 2 {
+        status = my_pkt.RI16(&r)
+    }
+    return aff, last, status
+}
+
+// ---- auth helpers ---------------------------------------------------------
+
+// xorN xor's n bytes of a and b into a fresh buffer.
+fn xorN(a: string, b: string, n: int) -> string {
+    out := libc.malloc(n + 1)
+    for i := 0; i < n; i = i + 1 {
+        out[i] = a[i] ^ b[i]
+    }
+    out[n] = 0
+    return out
+}
+
+// sha1 returns the 20-byte digest of data[0..n).
+fn sha1(data: string, n: int) -> string {
+    out := libc.malloc(21)
+    SHA1(data, int64(n), out)
+    out[20] = 0
+    return out
+}
+
+// sha256 returns the 32-byte digest of data[0..n).
+fn sha256(data: string, n: int) -> string {
+    out := libc.malloc(33)
+    SHA256(data, int64(n), out)
+    out[32] = 0
+    return out
+}
+
+// concatN joins two binary buffers by explicit length.
+fn concatN(a: string, an: int, b: string, bn: int) -> (string, int) {
+    out := libc.malloc(an + bn + 1)
+    libc.memcpy(out, a, an)
+    libc.memcpy(string(int64(out) + int64(an)), b, bn)
+    out[an + bn] = 0
+    return out, an + bn
+}
+
+// scrambleNative computes the mysql_native_password token:
+//   SHA1(pw) XOR SHA1(nonce + SHA1(SHA1(pw)))
+pub fn ScrambleNative(password: string, nonce: string, nonceLen: int) -> (string, int) {
+    stage1 := sha1(password, str.Len(password))
+    stage2 := sha1(stage1, 20)
+    inner, innerN := concatN(nonce, nonceLen, stage2, 20)
+    stage3 := sha1(inner, innerN)
+    tok := xorN(stage1, stage3, 20)
+    libc.free(stage1)
+    libc.free(stage2)
+    libc.free(inner)
+    libc.free(stage3)
+    return tok, 20
+}
+
+// scrambleSha2 computes the caching_sha2_password fast-auth token:
+//   SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) + nonce)
+pub fn ScrambleSha2(password: string, nonce: string, nonceLen: int) -> (string, int) {
+    stage1 := sha256(password, str.Len(password))
+    stage2 := sha256(stage1, 32)
+    inner, innerN := concatN(stage2, 32, nonce, nonceLen)
+    stage3 := sha256(inner, innerN)
+    tok := xorN(stage1, stage3, 32)
+    libc.free(stage1)
+    libc.free(stage2)
+    libc.free(inner)
+    libc.free(stage3)
+    return tok, 32
+}
+
+// rsaEncryptPassword performs caching_sha2 full auth without TLS:
+// XOR the NUL-terminated password with the nonce, RSA-OAEP-encrypt
+// with the server's public key.
+fn rsaEncryptPassword(password: string, nonce: string, nonceLen: int, pubPem: string, pubLen: int) -> (string, int) {
+    if nonceLen <= 0 {
+        return "", 0
+    }
+    pwLen := str.Len(password) + 1 // include NUL
+    masked := libc.malloc(pwLen)
+    for i := 0; i < pwLen; i = i + 1 {
+        masked[i] = password[i] ^ nonce[i % nonceLen]
+    }
+    // The key-exchange reply carries a 0x01 marker before the PEM and
+    // the key itself is SPKI ("BEGIN PUBLIC KEY"), so parse through the
+    // generic EVP_PKEY reader then extract the RSA key.
+    pem := pubPem
+    pemLen := pubLen
+    if pemLen > 0 && pem[0] == 1 {
+        pem = string(int64(pem) + 1)
+        pemLen = pemLen - 1
+    }
+    bio := BIO_new_mem_buf(pem, pemLen)
+    if bio == int64(0) {
+        libc.free(masked)
+        return "", 0
+    }
+    pkey := PEM_read_bio_PUBKEY(bio, int64(0), int64(0), int64(0))
+    BIO_free(bio)
+    if pkey == int64(0) {
+        libc.free(masked)
+        return "", 0
+    }
+    rsa := EVP_PKEY_get1_RSA(pkey)
+    EVP_PKEY_free(pkey)
+    if rsa == int64(0) {
+        libc.free(masked)
+        return "", 0
+    }
+    // RSA_public_encrypt writes RSA_size(rsa) bytes — size the output
+    // buffer from the actual key so a hostile server's oversized key
+    // cannot overflow a fixed allocation.
+    rs := RSA_size(rsa)
+    if rs <= 0 || rs > 4096 {
+        RSA_free(rsa)
+        libc.free(masked)
+        return "", 0
+    }
+    out := libc.malloc(rs + 1)
+    // RSA_PKCS1_OAEP_PADDING = 4
+    elen := RSA_public_encrypt(pwLen, masked, out, rsa, 4)
+    RSA_free(rsa)
+    libc.free(masked)
+    if elen <= 0 {
+        libc.free(out)
+        return "", 0
+    }
+    return out, elen
+}
+
+// ---- handshake -------------------------------------------------------------
+
+// writeHandshakeResponse builds and sends the protocol-41 response.
+fn writeHandshakeResponse(c: *MyConn, info: dbx_dsn.ConnInfo, caps: int,
+        plugin: string, authResp: string, authLen: int, seq: int) -> errors.Error {
+    b := my_pkt.NewOutBuf(128)
+    my_pkt.I32(&b, int64(caps))
+    my_pkt.I32(&b, int64(16777216)) // max packet 16 MiB
+    my_pkt.Byte(&b, 45)             // utf8mb4_general_ci / utf8mb4
+    for i := 0; i < 23; i = i + 1 {
+        my_pkt.Byte(&b, 0)
+    }
+    my_pkt.CStr(&b, info.User)
+    if (caps & CAP_SECURE_CONN) != 0 {
+        my_pkt.LenencStr(&b, authResp, authLen)
+    } else {
+        my_pkt.CStr(&b, authResp)
+    }
+    if (caps & CAP_CONNECT_WITH_DB) != 0 && str.Len(info.Database) > 0 {
+        my_pkt.CStr(&b, info.Database)
+    }
+    if (caps & CAP_PLUGIN_AUTH) != 0 && str.Len(plugin) > 0 {
+        my_pkt.CStr(&b, plugin)
+    }
+    body, n := my_pkt.Data(&b)
+    err := my_pkt.Send(&c.Bc, seq, body, n)
+    my_pkt.Free(&b)
+    return err
+}
+
+// scrambleFor produces the auth response bytes for the named plugin.
+fn scrambleFor(plugin: string, password: string, nonce: string, nonceLen: int) -> (string, int) {
+    if str.Equal(plugin, AUTH_SHA2) {
+        return ScrambleSha2(password, nonce, nonceLen)
+    }
+    return ScrambleNative(password, nonce, nonceLen)
+}
+
+// authResult reads post-handshake packets until an OK or a fatal error.
+// Handles auth-switch requests (0xfe) and caching_sha2 more-data (0x01).
+fn authResult(c: *MyConn, info: dbx_dsn.ConnInfo, nonce: string, nonceLen: int, seqIn: int) -> errors.Error {
+    seq := seqIn
+    plugin := c.PluginName
+    curNonce := nonce
+    curNonceLen := nonceLen
+    for {
+        body, n, rseq, err := my_pkt.Recv(&c.Bc)
+        if str.Len(err.message) > 0 {
+            return err
+        }
+        if n == 0 {
+            continue
+        }
+        if isErr(body, n) {
+            return errors.New(ParseErr(body, n))
+        }
+        if body[0] == PKT_OK {
+            return errors.New("")
+        }
+        if body[0] == PKT_AUTH_SWITCH && n > 1 {
+            // 0xfe plugin\0 authdata
+            r := my_pkt.NewReader(body, n)
+            my_pkt.RByte(&r)
+            plugin = my_pkt.RCStr(&r)
+            c.PluginName = plugin // record the post-switch plugin
+            curNonce, curNonceLen = my_pkt.RRest(&r)
+            // Auth-switch data is NUL-terminated — the terminator is
+            // not part of the nonce.
+            for curNonceLen > 0 && curNonce[curNonceLen - 1] == 0 {
+                curNonceLen = curNonceLen - 1
+            }
+            tok, tn := scrambleFor(plugin, info.Password, curNonce, curNonceLen)
+            seq = rseq + 1
+            serr := my_pkt.Send(&c.Bc, seq, tok, tn)
+            libc.free(tok)
+            if str.Len(serr.message) > 0 {
+                return serr
+            }
+            continue
+        }
+        if body[0] == PKT_MORE_DATA {
+            // caching_sha2 follow-ups: 0x03 fast-ok, 0x04 full auth.
+            if n >= 2 && body[1] == 3 {
+                continue // fast auth succeeded; OK follows
+            }
+            if n >= 2 && body[1] == 4 {
+                // Full auth required.
+                seq = rseq + 1
+                if c.Bc.IsTLS() {
+                    // Cleartext password + NUL over the TLS channel.
+                    pw := libc.malloc(str.Len(info.Password) + 1)
+                    libc.memcpy(pw, info.Password, str.Len(info.Password) + 1)
+                    serr := my_pkt.Send(&c.Bc, seq, pw, str.Len(info.Password) + 1)
+                    libc.free(pw)
+                    if str.Len(serr.message) > 0 {
+                        return serr
+                    }
+                    continue
+                }
+                // Request the server's RSA public key (type 0x02).
+                // (Built via malloc — Skink literals have no \xNN escapes.)
+                pkreq := libc.malloc(2)
+                pkreq[0] = 2
+                pkreq[1] = 0
+                serr := my_pkt.Send(&c.Bc, seq, pkreq, 1)
+                if str.Len(serr.message) > 0 {
+                    return serr
+                }
+                pk, pkLen, pkseq, perr := my_pkt.Recv(&c.Bc)
+                rseq = pkseq
+                if str.Len(perr.message) > 0 {
+                    return perr
+                }
+                if isErr(pk, pkLen) {
+                    return errors.New(ParseErr(pk, pkLen))
+                }
+                enc, en := rsaEncryptPassword(info.Password, curNonce, curNonceLen, pk, pkLen)
+                if en == 0 {
+                    return errors.New("mysql: caching_sha2 full auth failed (RSA encrypt)")
+                }
+                seq = rseq + 1
+                serr = my_pkt.Send(&c.Bc, seq, enc, en)
+                libc.free(enc)
+                if str.Len(serr.message) > 0 {
+                    return serr
+                }
+                continue
+            }
+            // Unknown sub-packet: echo back as-is (defensive).
+            continue
+        }
+        return errors.New("mysql: unexpected auth packet")
+    }
+    return errors.New("")
+}
+
+// Connect performs TCP dial, optional TLS upgrade, handshake and auth.
+pub fn Connect(info: dbx_dsn.ConnInfo) -> (MyConn, errors.Error) {
+    host := info.Host
+    if str.Len(host) == 0 {
+        host = "localhost"
+    }
+    port := dbx_dsn.PortOr(info, 3306)
+    bc, derr := dbx_bufconn.Dial(host, port, 10000)
+    if str.Len(derr.message) > 0 {
+        return MyConn{}, derr
+    }
+    conn := MyConn{Bc: bc}
+
+    // Initial handshake packet (server seq 0).
+    body, n, _, herr := my_pkt.Recv(&conn.Bc)
+    if str.Len(herr.message) > 0 {
+        conn.Bc.Close()
+        return MyConn{}, herr
+    }
+    if isErr(body, n) {
+        emsg := ParseErr(body, n)
+        conn.Bc.Close()
+        return MyConn{}, errors.New(emsg)
+    }
+    r := my_pkt.NewReader(body, n)
+    my_pkt.RByte(&r) // protocol version
+    conn.ServerVer = my_pkt.RCStr(&r)
+    conn.ConnID = my_pkt.RI32(&r)
+    salt1, s1n := my_pkt.RBytes(&r, 8)
+    my_pkt.RByte(&r) // filler 0x00
+    capsLo := my_pkt.RI16(&r)
+    var salt2 string
+    salt2 = ""
+    s2n := 0
+    if my_pkt.Remaining(&r) <= 0 {
+        // Old protocol without plugin data.
+        conn.ServerCaps = capsLo
+        conn.PluginName = AUTH_NATIVE
+    } else {
+        my_pkt.RByte(&r)   // charset
+        my_pkt.RI16(&r)    // status
+        capsHi := my_pkt.RI16(&r)
+        conn.ServerCaps = capsLo | (capsHi << 16)
+        authLen := my_pkt.RByte(&r)
+        for i := 0; i < 10; i = i + 1 {
+            my_pkt.RByte(&r) // reserved
+        }
+        saltLen := authLen - 8
+        if saltLen < 12 {
+            saltLen = 12
+        }
+        if saltLen > my_pkt.Remaining(&r) {
+            saltLen = my_pkt.Remaining(&r)
+        }
+        salt2, s2n = my_pkt.RBytes(&r, saltLen)
+        // salt2 may carry a trailing NUL — trim to real nonce bytes.
+        for s2n > 0 && salt2[s2n - 1] == 0 {
+            s2n = s2n - 1
+        }
+        if my_pkt.Remaining(&r) > 0 {
+            conn.PluginName = my_pkt.RCStr(&r)
+        } else {
+            conn.PluginName = AUTH_NATIVE
+        }
+    }
+
+    // Assemble the 20-byte nonce.
+    nonce, nonceLen := concatN(salt1, s1n, salt2, s2n)
+
+    // Capability flags we advertise.
+    caps := CAP_LONG_PASSWORD | CAP_LONG_FLAG | CAP_PROTOCOL_41 |
+        CAP_TRANSACTIONS | CAP_SECURE_CONN | CAP_MULTI_RESULTS
+    if (conn.ServerCaps & CAP_PLUGIN_AUTH) != 0 {
+        caps = caps | CAP_PLUGIN_AUTH
+    }
+    if str.Len(info.Database) > 0 {
+        caps = caps | CAP_CONNECT_WITH_DB
+    }
+    ssl := dbx_dsn.ParamOr(info, "ssl", "")
+    tls := dbx_dsn.ParamOr(info, "tls", "")
+    wantTLS := str.Equal(ssl, "true") || str.Equal(ssl, "required") ||
+        str.Equal(tls, "true") || str.Equal(tls, "required")
+    seq := 1
+    if wantTLS && (conn.ServerCaps & CAP_SSL) == 0 {
+        // Caller asked for TLS but the server can't do it — proceeding
+        // plaintext would send credentials in the clear. Fail closed.
+        conn.Bc.Close()
+        return MyConn{}, errors.New("mysql: tls required but server lacks SSL capability")
+    }
+    if wantTLS && (conn.ServerCaps & CAP_SSL) != 0 {
+        caps = caps | CAP_SSL
+        // SSL request packet: caps + maxpkt + charset + 23 zeros.
+        sb := my_pkt.NewOutBuf(32)
+        my_pkt.I32(&sb, int64(caps))
+        my_pkt.I32(&sb, int64(16777216))
+        my_pkt.Byte(&sb, 45)
+        for i := 0; i < 23; i = i + 1 {
+            my_pkt.Byte(&sb, 0)
+        }
+        sbody, sn := my_pkt.Data(&sb)
+        serr := my_pkt.Send(&conn.Bc, 1, sbody, sn)
+        my_pkt.Free(&sb)
+        if str.Len(serr.message) > 0 {
+            conn.Bc.Close()
+            return MyConn{}, serr
+        }
+        terr := conn.Bc.StartTLS(false)
+        if str.Len(terr.message) > 0 {
+            conn.Bc.Close()
+            return MyConn{}, terr
+        }
+        seq = 2
+    }
+
+    caps = caps & conn.ServerCaps // never set a flag the server lacks
+    if (conn.ServerCaps & CAP_PLUGIN_AUTH) == 0 {
+        caps = caps & (0x7fffffff - CAP_PLUGIN_AUTH)
+    }
+
+    tok, tn := scrambleFor(conn.PluginName, info.Password, nonce, nonceLen)
+    herr = writeHandshakeResponse(&conn, info, caps, conn.PluginName, tok, tn, seq)
+    libc.free(tok)
+    if str.Len(herr.message) > 0 {
+        conn.Bc.Close()
+        return MyConn{}, herr
+    }
+
+    aerr := authResult(&conn, info, nonce, nonceLen, seq + 1)
+    if str.Len(aerr.message) > 0 {
+        conn.Bc.Close()
+        return MyConn{}, aerr
+    }
+    return conn, errors.New("")
+}
+
+// Close sends COM_QUIT and releases the socket.
+pub fn Close(c: *MyConn) -> errors.Error {
+    b := my_pkt.NewOutBuf(1)
+    my_pkt.Byte(&b, COM_QUIT)
+    body, n := my_pkt.Data(&b)
+    my_pkt.Send(&c.Bc, 0, body, n)
+    my_pkt.Free(&b)
+    c.Bc.Close()
+    return errors.New("")
+}
+
+// ---- result-set reading ---------------------------------------------------
+
+// MyResult bundles a query's outcome.
+pub struct MyResult {
+    Columns:   []string
+    Data:      [][]dbx_value.Value
+    Affected:  int64
+    LastId:    int64
+    WarningCnt: int
+}
+
+// readColumnDefs reads n ColumnDefinition41 packets plus the EOF
+// terminator (DEPRECATE_EOF is not negotiated, so a real EOF arrives).
+fn readColumnDefs(c: *MyConn, count: int) -> ([]ColDef, errors.Error) {
+    var cols []ColDef
+    for i := 0; i < count; i = i + 1 {
+        body, n, _, err := my_pkt.Recv(&c.Bc)
+        if str.Len(err.message) > 0 {
+            return cols, err
+        }
+        if isErr(body, n) {
+            return cols, errors.New(ParseErr(body, n))
+        }
+        r := my_pkt.NewReader(body, n)
+        // six lenenc strings: catalog, schema, table, org_table,
+        // name, org_name
+        my_pkt.RLenencStr(&r)
+        my_pkt.RLenencStr(&r)
+        my_pkt.RLenencStr(&r)
+        my_pkt.RLenencStr(&r)
+        name, _, _ := my_pkt.RLenencStr(&r)
+        my_pkt.RLenencStr(&r)
+        my_pkt.RLenenc(&r) // 0x0c fixed-length marker
+        charset := my_pkt.RI16(&r)
+        my_pkt.RI32(&r)   // column length
+        ctype := my_pkt.RByte(&r)
+        flags := my_pkt.RI16(&r)
+        my_pkt.RByte(&r)  // decimals
+        cols = append(cols, ColDef{Name: name, ColType: ctype, Flags: flags, Charset: charset})
+    }
+    // EOF terminator.
+    body, n, _, err := my_pkt.Recv(&c.Bc)
+    if str.Len(err.message) > 0 {
+        return cols, err
+    }
+    if isErr(body, n) {
+        return cols, errors.New(ParseErr(body, n))
+    }
+    return cols, errors.New("")
+}
+
+// readTextRows reads text-protocol rows until the EOF terminator.
+fn readTextRows(c: *MyConn, cols: []ColDef, res: *MyResult) -> errors.Error {
+    for {
+        body, n, _, err := my_pkt.Recv(&c.Bc)
+        if str.Len(err.message) > 0 {
+            return err
+        }
+        if isErr(body, n) {
+            return errors.New(ParseErr(body, n))
+        }
+        if isEOF(body, n) {
+            return errors.New("")
+        }
+        r := my_pkt.NewReader(body, n)
+        var row []dbx_value.Value
+        for i := 0; i < len(cols); i = i + 1 {
+            cell, cn, isNull := my_pkt.RLenencStr(&r)
+            if isNull {
+                row = append(row, dbx_value.Null())
+            } else {
+                row = append(row, my_type.DecodeText(cols[i].ColType, cols[i].Flags, cell, cn))
+            }
+        }
+        res.Data = append(res.Data, row)
+    }
+    return errors.New("")
+}
+
+// readBinaryRows reads binary-protocol rows (prepared-stmt results):
+// 0x00 header + NULL bitmap ((ncols+9)/8, bit offset 2) + values.
+fn readBinaryRows(c: *MyConn, cols: []ColDef, res: *MyResult) -> errors.Error {
+    bmpLen := (len(cols) + 9) / 8
+    for {
+        body, n, _, err := my_pkt.Recv(&c.Bc)
+        if str.Len(err.message) > 0 {
+            return err
+        }
+        if isErr(body, n) {
+            return errors.New(ParseErr(body, n))
+        }
+        if isEOF(body, n) {
+            return errors.New("")
+        }
+        if n < 1 || body[0] != 0 {
+            continue // skip anything unexpected
+        }
+        if n < 1 + bmpLen {
+            // Truncated row: the NULL bitmap indexes would read past
+            // the packet payload.
+            return errors.New("mysql: truncated binary row")
+        }
+        r := my_pkt.NewReader(body, n)
+        r.Pos = 1 + bmpLen // header byte + NULL bitmap
+        var row []dbx_value.Value
+        for i := 0; i < len(cols); i = i + 1 {
+            bmpByte := body[1 + (i + 2) / 8]
+            bmpBit := (i + 2) % 8
+            if (bmpByte & (1 << bmpBit)) != 0 {
+                row = append(row, dbx_value.Null())
+            } else {
+                row = append(row, my_type.DecodeBinary(cols[i].ColType, cols[i].Flags, &r))
+            }
+        }
+        res.Data = append(res.Data, row)
+    }
+    return errors.New("")
+}
+
+// finishResult reads the tail of a result exchange: either a bare
+// OK/ERR packet or a column-count → defs → rows sequence.
+// binary selects the row protocol variant.
+fn finishResult(c: *MyConn, res: *MyResult, binary: bool) -> errors.Error {
+    body, n, _, err := my_pkt.Recv(&c.Bc)
+    if str.Len(err.message) > 0 {
+        return err
+    }
+    if n == 0 {
+        return errors.New("mysql: empty result packet")
+    }
+    if isErr(body, n) {
+        return errors.New(ParseErr(body, n))
+    }
+    // OK packets may exceed 9 bytes when the server appends
+    // session-state tracking info (CLIENT_SESSION_TRACK). A result
+    // set never begins with 0x00 — that would be a NULL lenenc — so
+    // the header byte alone identifies the OK packet.
+    if body[0] == PKT_OK {
+        aff, last, status := parseOK(body, n)
+        res.Affected = aff
+        res.LastId = last
+        c.ServerStatus = status
+        return errors.New("")
+    }
+    if body[0] == PKT_LOCAL_INFILE {
+        return errors.New("mysql: LOCAL INFILE requests are refused")
+    }
+    // Otherwise a lenenc column count.
+    r := my_pkt.NewReader(body, n)
+    cnt, isNull := my_pkt.RLenenc(&r)
+    if isNull || cnt <= 0 {
+        return errors.New("mysql: malformed column count")
+    }
+    cols, cerr := readColumnDefs(c, int(cnt))
+    if str.Len(cerr.message) > 0 {
+        return cerr
+    }
+    c.Cols = cols
+    var names []string
+    for i := 0; i < len(cols); i = i + 1 {
+        names = append(names, cols[i].Name)
+    }
+    res.Columns = names
+    if binary {
+        return readBinaryRows(c, cols, res)
+    }
+    return readTextRows(c, cols, res)
+}
+
+// ---- commands -------------------------------------------------------------
+
+// Query runs a text-protocol COM_QUERY. For bound parameters use
+// QueryParams (prepared statement path).
+pub fn Query(c: *MyConn, sql: string) -> (MyResult, errors.Error) {
+    res := MyResult{}
+    b := my_pkt.NewOutBuf(str.Len(sql) + 1)
+    my_pkt.Byte(&b, COM_QUERY)
+    my_pkt.WriteN(&b, sql, str.Len(sql))
+    body, n := my_pkt.Data(&b)
+    err := my_pkt.Send(&c.Bc, 0, body, n)
+    my_pkt.Free(&b)
+    if str.Len(err.message) > 0 {
+        return res, err
+    }
+    ferr := finishResult(c, &res, false)
+    return res, ferr
+}
+
+// interpolate substitutes '?' markers with escaped literals for
+// servers where prepared statements are not wanted. Prefer
+// QueryParams which binds server-side.
+pub fn interpolate(sql: string, args: []dbx_value.Value) -> string {
+    out := my_pkt.NewOutBuf(str.Len(sql) + 32)
+    n := str.Len(sql)
+    arg := 0
+    i := 0
+    for i < n {
+        c := sql[i]
+        if c == 39 { // '...'
+            my_pkt.Byte(&out, c)
+            i = i + 1
+            for i < n {
+                my_pkt.Byte(&out, sql[i])
+                if sql[i] == 39 {
+                    if i + 1 < n && sql[i + 1] == 39 {
+                        i = i + 1
+                        my_pkt.Byte(&out, sql[i])
+                        i = i + 1
+                        continue
+                    }
+                    i = i + 1
+                    break
+                }
+                if sql[i] == 92 && i + 1 < n { // backslash escape
+                    i = i + 1
+                    my_pkt.Byte(&out, sql[i])
+                    i = i + 1
+                    continue
+                }
+                i = i + 1
+            }
+        } else if c == 34 || c == 96 { // "..." or `...` — '?' inside
+            // a quoted string/identifier is literal text, not a param.
+            my_pkt.Byte(&out, c)
+            i = i + 1
+            for i < n && sql[i] != c {
+                my_pkt.Byte(&out, sql[i])
+                i = i + 1
+            }
+            if i < n {
+                my_pkt.Byte(&out, sql[i]) // closing quote
+                i = i + 1
+            }
+        } else if (c == 45 && i + 1 < n && sql[i + 1] == 45) ||
+                c == 35 { // '--' or '#' line comment — copy verbatim
+            for i < n && sql[i] != 10 {
+                my_pkt.Byte(&out, sql[i])
+                i = i + 1
+            }
+        } else if c == 47 && i + 1 < n && sql[i + 1] == 42 { // /* */
+            my_pkt.Byte(&out, c)
+            my_pkt.Byte(&out, 42)
+            i = i + 2
+            for i + 1 < n && !(sql[i] == 42 && sql[i + 1] == 47) {
+                my_pkt.Byte(&out, sql[i])
+                i = i + 1
+            }
+            if i + 1 < n {
+                my_pkt.Byte(&out, 42)
+                my_pkt.Byte(&out, 47)
+                i = i + 2
+            }
+        } else if c == 63 && arg < len(args) { // '?'
+            lit := my_type.EncodeLiteral(args[arg])
+            my_pkt.WriteN(&out, lit, str.Len(lit))
+            arg = arg + 1
+            i = i + 1
+        } else {
+            my_pkt.Byte(&out, c)
+            i = i + 1
+        }
+    }
+    s, ln := my_pkt.Data(&out)
+    copy := libc.malloc(ln + 1)
+    libc.memcpy(copy, s, ln + 1)
+    my_pkt.Free(&out)
+    return copy
+}
+
+// queryPrepared is the COM_STMT_PREPARE → EXECUTE → CLOSE pipeline.
+fn queryPrepared(c: *MyConn, sql: string, args: []dbx_value.Value) -> (MyResult, errors.Error) {
+    res := MyResult{}
+    // PREPARE
+    b := my_pkt.NewOutBuf(str.Len(sql) + 1)
+    my_pkt.Byte(&b, COM_STMT_PREPARE)
+    my_pkt.WriteN(&b, sql, str.Len(sql))
+    body, n := my_pkt.Data(&b)
+    err := my_pkt.Send(&c.Bc, 0, body, n)
+    my_pkt.Free(&b)
+    if str.Len(err.message) > 0 {
+        return res, err
+    }
+    body, n, _, err = my_pkt.Recv(&c.Bc)
+    if str.Len(err.message) > 0 {
+        return res, err
+    }
+    if isErr(body, n) {
+        return res, errors.New(ParseErr(body, n))
+    }
+    if n < 12 || body[0] != 0 {
+        return res, errors.New("mysql: malformed prepare response")
+    }
+    r := my_pkt.NewReader(body, n)
+    my_pkt.RByte(&r)
+    stmtID := int(my_pkt.RI32(&r))
+    numCols := my_pkt.RI16(&r)
+    numParams := my_pkt.RI16(&r)
+    my_pkt.RByte(&r) // filler
+    my_pkt.RI16(&r)  // warnings
+    // Param defs then EOF; col defs then EOF.
+    if numParams > 0 {
+        for i := 0; i < numParams; i = i + 1 {
+            _, _, _, perr := my_pkt.Recv(&c.Bc)
+            if str.Len(perr.message) > 0 {
+                return res, perr
+            }
+        }
+        my_pkt.Recv(&c.Bc) // EOF
+    }
+    if numCols > 0 {
+        for i := 0; i < numCols; i = i + 1 {
+            _, _, _, perr := my_pkt.Recv(&c.Bc)
+            if str.Len(perr.message) > 0 {
+                return res, perr
+            }
+        }
+        my_pkt.Recv(&c.Bc) // EOF
+    }
+
+    // EXECUTE — params bound as VAR_STRING (or NULL via bitmap).
+    eb := my_pkt.NewOutBuf(64)
+    my_pkt.Byte(&eb, COM_STMT_EXECUTE)
+    my_pkt.I32(&eb, int64(stmtID))
+    my_pkt.Byte(&eb, 0)              // CURSOR_TYPE_NO_CURSOR
+    my_pkt.I32(&eb, int64(1))        // iteration count
+    if len(args) > 0 {
+        bmpLen := (len(args) + 7) / 8
+        bmpStart := eb.Len
+        for i := 0; i < bmpLen; i = i + 1 {
+            my_pkt.Byte(&eb, 0)
+        }
+        my_pkt.Byte(&eb, 1) // new-params-bound-flag
+        for i := 0; i < len(args); i = i + 1 {
+            if dbx_value.IsNull(args[i]) {
+                my_pkt.I16(&eb, my_type.T_NULL)
+            } else {
+                my_pkt.I16(&eb, my_type.T_VAR_STRING)
+            }
+        }
+        for i := 0; i < len(args); i = i + 1 {
+            if dbx_value.IsNull(args[i]) {
+                // set null bit
+                eb.Buf[bmpStart + i / 8] = eb.Buf[bmpStart + i / 8] | (1 << (i % 8))
+                continue
+            }
+            lit := encodeParamText(args[i])
+            my_pkt.LenencStr(&eb, lit, str.Len(lit))
+        }
+    }
+    ebody, en := my_pkt.Data(&eb)
+    err = my_pkt.Send(&c.Bc, 0, ebody, en)
+    my_pkt.Free(&eb)
+    if str.Len(err.message) > 0 {
+        stmtClose(c, stmtID)
+        return res, err
+    }
+    err = finishResult(c, &res, true)
+    stmtClose(c, stmtID)
+    return res, err
+}
+
+// encodeParamText renders a bound param as text bytes — the server
+// coerces it to the column type.
+fn encodeParamText(v: dbx_value.Value) -> string {
+    if v.Kind == dbx_value.KIND_INT {
+        return strconvItoa64(v.I64)
+    }
+    if v.Kind == dbx_value.KIND_FLOAT {
+        return encodeFloatText(v.F64)
+    }
+    if v.Kind == dbx_value.KIND_BOOL {
+        if v.Bool { return "1" }
+        return "0"
+    }
+    if v.Kind == dbx_value.KIND_BLOB {
+        return dbx_value.Bytes(v)
+    }
+    if v.Kind == dbx_value.KIND_TIME {
+        // Server coerces 'YYYY-MM-DD HH:MM:SS.ffffff' to the column type.
+        return my_type.FormatTimeMicros(v.I64)
+    }
+    return v.Str
+}
+
+// strconvItoa64 — local decimal formatter.
+fn strconvItoa64(v: int64) -> string {
+    if v == int64(0) {
+        return "0"
+    }
+    neg := false
+    n := v
+    if n < 0 {
+        neg = true
+        n = -n
+    }
+    buf := libc.malloc(24)
+    i := 23
+    buf[i] = 0
+    for n > 0 {
+        i = i - 1
+        buf[i] = 48 + int(n % int64(10))
+        n = n / int64(10)
+    }
+    if neg {
+        i = i - 1
+        buf[i] = 45
+    }
+    return string(int64(buf) + int64(i))
+}
+
+// encodeFloatText renders a float param (17 significant digits is
+// round-trip safe; trailing zeros trimmed for readability).
+fn encodeFloatText(v: float) -> string {
+    s := strconv.FormatFloat(v, 17)
+    dot := str.IndexOf(s, ".")
+    if dot >= 0 {
+        e := str.Len(s)
+        for e > dot + 1 && s[e - 1] == 48 {
+            e = e - 1
+        }
+        if e == dot + 1 {
+            e = e + 1
+        }
+        s = str.Substr(s, 0, e)
+    }
+    return s
+}
+
+// stmtClose releases a server-side prepared statement.
+fn stmtClose(c: *MyConn, stmtID: int) {
+    b := my_pkt.NewOutBuf(5)
+    my_pkt.Byte(&b, COM_STMT_CLOSE)
+    my_pkt.I32(&b, int64(stmtID))
+    body, n := my_pkt.Data(&b)
+    my_pkt.Send(&c.Bc, 0, body, n)
+    my_pkt.Free(&b)
+}
+
+// QueryParams runs sql with bound parameters via a prepared statement.
+// '?' markers are positional — no rewriting needed.
+pub fn QueryParams(c: *MyConn, sql: string, args: []dbx_value.Value) -> (MyResult, errors.Error) {
+    if len(args) == 0 {
+        return Query(c, sql)
+    }
+    return queryPrepared(c, sql, args)
+}
+
+// Exec runs sql and reports affected rows.
+pub fn Exec(c: *MyConn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    res, err := QueryParams(c, sql, args)
+    if str.Len(err.message) > 0 {
+        return int64(0), err
+    }
+    return res.Affected, errors.New("")
+}
+
+// Ping sends COM_PING.
+pub fn Ping(c: *MyConn) -> errors.Error {
+    b := my_pkt.NewOutBuf(1)
+    my_pkt.Byte(&b, COM_PING)
+    body, n := my_pkt.Data(&b)
+    err := my_pkt.Send(&c.Bc, 0, body, n)
+    my_pkt.Free(&b)
+    if str.Len(err.message) > 0 {
+        return err
+    }
+    body, n, _, err = my_pkt.Recv(&c.Bc)
+    if str.Len(err.message) > 0 {
+        return err
+    }
+    if isErr(body, n) {
+        return errors.New(ParseErr(body, n))
+    }
+    return errors.New("")
+}
+
+// Begin/CommitTx/RollbackTx manage the transaction lifecycle.
+pub fn Begin(c: *MyConn) -> errors.Error {
+    _, err := Query(c, "BEGIN")
+    return err
+}
+
+pub fn CommitTx(c: *MyConn) -> errors.Error {
+    _, err := Query(c, "COMMIT")
+    return err
+}
+
+pub fn RollbackTx(c: *MyConn) -> errors.Error {
+    _, err := Query(c, "ROLLBACK")
+    return err
+}

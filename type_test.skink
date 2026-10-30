@@ -1,0 +1,145 @@
+// File:    type_test.skink
+// Purpose: Unit tests for my_type — text/binary row decoding by column
+//          type, literal escaping for interpolated params, and the
+//          datetime parser.
+module type_test
+
+import "my_pkt"
+import "my_type"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/libc"
+import "std/testing"
+
+// TestTextInts covers int column decoding.
+pub fn TestTextInts() {
+    v := my_type.DecodeText(my_type.T_LONG, 0, "-42", 3)
+    testing.AssertEqualInt(dbx_value.KIND_INT, v.Kind, "long kind")
+    testing.AssertTrue(v.I64 == int64(-42), "long value")
+    v = my_type.DecodeText(my_type.T_LONGLONG, 0, "9223372036854775806", 19)
+    testing.AssertTrue(v.I64 == int64(9223372036854775806), "longlong value")
+    bad := my_type.DecodeText(my_type.T_LONG, 0, "abc", 3)
+    testing.AssertEqualInt(dbx_value.KIND_TEXT, bad.Kind, "bad int falls back")
+}
+
+// TestTextFloat covers float/double.
+pub fn TestTextFloat() {
+    v := my_type.DecodeText(my_type.T_DOUBLE, 0, "2.5", 3)
+    testing.AssertEqualInt(dbx_value.KIND_FLOAT, v.Kind, "double kind")
+    testing.AssertEqualFloat(2.5, v.F64, "double value")
+}
+
+// TestTextTemporal covers datetime decoding to micros.
+pub fn TestTextTemporal() {
+    v := my_type.DecodeText(my_type.T_DATETIME, 0, "1970-01-01 00:00:00", 19)
+    testing.AssertEqualInt(dbx_value.KIND_TIME, v.Kind, "datetime kind")
+    testing.AssertTrue(v.I64 == int64(0), "epoch micros")
+    v = my_type.DecodeText(my_type.T_DATE, 0, "2000-01-01", 10)
+    testing.AssertTrue(v.I64 == int64(10957) * int64(86400000000), "y2k days")
+    v = my_type.DecodeText(my_type.T_TIMESTAMP, 0, "2024-03-01 02:00:00.123456", 26)
+    testing.AssertTrue(v.I64 == int64(1709258400123456), "micros fraction")
+    // TIME stays text (durations can exceed 24h).
+    v = my_type.DecodeText(my_type.T_TIME, 0, "25:30:00", 8)
+    testing.AssertEqualInt(dbx_value.KIND_TEXT, v.Kind, "time stays text")
+}
+
+// TestTextBlob covers the binary flag deciding blob vs text.
+pub fn TestTextBlob() {
+    v := my_type.DecodeText(my_type.T_BLOB, my_type.FLAG_BINARY, "ab", 2)
+    testing.AssertEqualInt(dbx_value.KIND_BLOB, v.Kind, "binary flag → blob")
+    v = my_type.DecodeText(my_type.T_BLOB, 0, "ab", 2)
+    testing.AssertEqualInt(dbx_value.KIND_TEXT, v.Kind, "no flag → text")
+    v = my_type.DecodeText(my_type.T_NEWDECIMAL, 0, "1.5", 3)
+    testing.AssertEqualInt(dbx_value.KIND_TEXT, v.Kind, "decimal text")
+}
+
+// TestBinaryInts covers the binary row protocol for integer columns.
+pub fn TestBinaryInts() {
+    b := my_pkt.NewOutBuf(16)
+    my_pkt.Byte(&b, 0)          // row header
+    my_pkt.Byte(&b, 0)          // null bitmap (2 cols, all clear)
+    my_pkt.I32(&b, int64(-7))   // LONG
+    my_pkt.I64(&b, int64(42))   // LONGLONG
+    data, n := my_pkt.Data(&b)
+
+    r := my_pkt.NewReader(data, n)
+    r.Pos = 2
+    v := my_type.DecodeBinary(my_type.T_LONG, 0, &r)
+    testing.AssertTrue(v.I64 == int64(-7), "binary long signed")
+    v = my_type.DecodeBinary(my_type.T_LONGLONG, 0, &r)
+    testing.AssertTrue(v.I64 == int64(42), "binary longlong")
+    my_pkt.Free(&b)
+}
+
+// TestBinaryFloat covers binary float4/float8.
+pub fn TestBinaryFloat() {
+    b := my_pkt.NewOutBuf(16)
+    my_pkt.Byte(&b, 0)
+    my_pkt.Byte(&b, 0)
+    // float32 1.5 = 0x3FC00000 LE; float64 3.25 = 0x400A000000000000
+    my_pkt.I32(&b, int64(0x3FC00000))
+    var f float
+    f = 3.25
+    bits := libc.malloc(8)
+    libc.memcpy(bits, &f, 8)
+    my_pkt.WriteN(&b, bits, 8)
+    data, n := my_pkt.Data(&b)
+
+    r := my_pkt.NewReader(data, n)
+    r.Pos = 2
+    v := my_type.DecodeBinary(my_type.T_FLOAT, 0, &r)
+    testing.AssertEqualFloat(1.5, v.F64, "binary float32")
+    v = my_type.DecodeBinary(my_type.T_DOUBLE, 0, &r)
+    testing.AssertEqualFloat(3.25, v.F64, "binary float64")
+    my_pkt.Free(&b)
+}
+
+// TestBinaryTemporal covers binary datetime: len byte + fields.
+pub fn TestBinaryTemporal() {
+    b := my_pkt.NewOutBuf(16)
+    my_pkt.Byte(&b, 0)
+    my_pkt.Byte(&b, 0)
+    my_pkt.Byte(&b, 7)               // len
+    my_pkt.I16(&b, 2024)             // year
+    my_pkt.Byte(&b, 3)               // month
+    my_pkt.Byte(&b, 1)               // day
+    my_pkt.Byte(&b, 2)               // hh
+    my_pkt.Byte(&b, 0)               // mm
+    my_pkt.Byte(&b, 0)               // ss
+    data, n := my_pkt.Data(&b)
+    r := my_pkt.NewReader(data, n)
+    r.Pos = 2
+    v := my_type.DecodeBinary(my_type.T_DATETIME, 0, &r)
+    testing.AssertTrue(v.I64 == int64(1709258400000000), "binary datetime micros")
+    my_pkt.Free(&b)
+}
+
+// TestLiteral covers SQL literal escaping for interpolation.
+pub fn TestLiteral() {
+    s := my_type.EncodeLiteral(dbx_value.Int(int64(42)))
+    testing.AssertEqualString("42", s, "int")
+    s = my_type.EncodeLiteral(dbx_value.Null())
+    testing.AssertEqualString("NULL", s, "null")
+    s = my_type.EncodeLiteral(dbx_value.Bool(true))
+    testing.AssertEqualString("1", s, "bool")
+    s = my_type.EncodeLiteral(dbx_value.Text("it's"))
+    testing.AssertEqualString("'it\\'s'", s, "quote escaped")
+    s = my_type.EncodeLiteral(dbx_value.Text("a\nb"))
+    testing.AssertEqualString("'a\\nb'", s, "newline escaped")
+}
+
+// TestBlobLiteral — regression: blob literals must use X'..' so they
+// always decode as binary; a bare 0x<hex> literal is numeric in some
+// MySQL contexts. Also covers the previously dead write that emitted
+// garbage before '0x' was stamped over it.
+pub fn TestBlobLiteral() {
+    // Skink strings don't support \xNN escapes — build the bytes raw.
+    buf := libc.malloc(4)
+    buf[0] = 1
+    buf[1] = 255
+    buf[2] = 10
+    buf[3] = 0
+    lit := my_type.EncodeLiteral(dbx_value.Blob(buf, 3))
+    libc.free(buf)
+    testing.AssertEqualString("X'01ff0a'", lit, "blob literal")
+}

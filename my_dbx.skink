@@ -1,0 +1,134 @@
+// File:    my_dbx.skink
+// Purpose: dbx driver adapter for MySQL/MariaDB. Registers a
+//          dbx.Driver under the "mysql" scheme ("mariadb://" is
+//          normalised by dbx.Open). '?' placeholders bind natively via
+//          prepared statements — no rewriting needed.
+module my_dbx
+
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "mod/markoxley/skink-dbx/dbx_rows"
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "my_conn"
+import "std/str"
+import "std/errors"
+
+// connBoxes is the handle table behind Conn.State — Skink cannot cast
+// an int64 back to a *MyConn, so each connection lives in a len-1
+// slice (a stable heap pointer) stored under an int handle.
+var connBoxes map[int][]my_conn.MyConn
+var connNext = 1
+
+// boxConn stores a MyConn and returns its handle.
+fn boxConn(c: my_conn.MyConn) -> int64 {
+    if connBoxes == nil {
+        connBoxes = make(map[int][]my_conn.MyConn)
+    }
+    s := make([]my_conn.MyConn, 1)
+    s[0] = c
+    h := connNext
+    connNext = connNext + 1
+    connBoxes[h] = s
+    return int64(h)
+}
+
+// connOf recovers the *MyConn from a Conn's opaque State.
+fn connOf(c: *dbx_driver.Conn) -> *my_conn.MyConn {
+    return &connBoxes[int(c.State)][0]
+}
+
+// dropConn releases a handle's box.
+fn dropConn(h: int64) {
+    if connBoxes != nil {
+        delete(connBoxes, int(h))
+    }
+}
+
+// rowsOf adapts a MyResult into dbx_rows.Rows.
+fn rowsOf(res: my_conn.MyResult) -> dbx_rows.Rows {
+    return dbx_rows.NewRows(res.Columns, res.Data)
+}
+
+fn queryImpl(c: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    my := connOf(c)
+    res, err := my_conn.QueryParams(my, sql, args)
+    if str.Len(err.message) > 0 {
+        return dbx_rows.NewRows([]string{}, [][]dbx_value.Value{}), err
+    }
+    return rowsOf(res), errors.New("")
+}
+
+fn execImpl(c: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    return my_conn.Exec(connOf(c), sql, args)
+}
+
+fn pingImpl(c: *dbx_driver.Conn) -> errors.Error {
+    return my_conn.Ping(connOf(c))
+}
+
+fn closeImpl(c: *dbx_driver.Conn) -> errors.Error {
+    err := my_conn.Close(connOf(c))
+    dropConn(c.State)
+    return err
+}
+
+// === transactions ===
+
+fn txConn(t: *dbx_driver.Tx) -> *my_conn.MyConn {
+    return &connBoxes[int(t.State)][0]
+}
+
+fn txQueryImpl(t: *dbx_driver.Tx, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    res, err := my_conn.QueryParams(txConn(t), sql, args)
+    if str.Len(err.message) > 0 {
+        return dbx_rows.NewRows([]string{}, [][]dbx_value.Value{}), err
+    }
+    return rowsOf(res), errors.New("")
+}
+
+fn txExecImpl(t: *dbx_driver.Tx, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    return my_conn.Exec(txConn(t), sql, args)
+}
+
+fn txCommitImpl(t: *dbx_driver.Tx) -> errors.Error {
+    return my_conn.CommitTx(txConn(t))
+}
+
+fn txRollbackImpl(t: *dbx_driver.Tx) -> errors.Error {
+    return my_conn.RollbackTx(txConn(t))
+}
+
+fn beginImpl(c: *dbx_driver.Conn) -> (dbx_driver.Tx, errors.Error) {
+    err := my_conn.Begin(connOf(c))
+    if str.Len(err.message) > 0 {
+        return dbx_driver.Tx{}, err
+    }
+    c.InTx = true
+    t := dbx_driver.Tx{State: c.State}
+    t.queryFn = txQueryImpl
+    t.execFn = txExecImpl
+    t.commitFn = txCommitImpl
+    t.rollbackFn = txRollbackImpl
+    return t, errors.New("")
+}
+
+// openImpl is the dbx Driver.Open entry point for "mysql"/"mariadb".
+fn openImpl(info: dbx_dsn.ConnInfo) -> (dbx_driver.Conn, errors.Error) {
+    conn, err := my_conn.Connect(info)
+    if str.Len(err.message) > 0 {
+        return dbx_driver.Conn{}, err
+    }
+    dc := dbx_driver.Conn{Name: "mysql", State: boxConn(conn)}
+    dc.queryFn = queryImpl
+    dc.execFn = execImpl
+    dc.pingFn = pingImpl
+    dc.beginFn = beginImpl
+    dc.closeFn = closeImpl
+    return dc, errors.New("")
+}
+
+// Register installs the MySQL driver into the dbx registry so
+// dbx.Open("mysql://...") works.
+pub fn Register() {
+    dbx_driver.RegisterDriver(dbx_driver.Driver{Name: "mysql", Open: openImpl})
+}

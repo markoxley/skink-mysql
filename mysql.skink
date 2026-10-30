@@ -1,0 +1,53 @@
+// File:    mysql.skink
+// Purpose: Root module for skink-mysql. Re-exports the connection and
+//          adapter entry points so applications need only
+//          `import "mod/markoxley/skink-mysql"`. Call mysql.Register()
+//          once to make "mysql://" / "mariadb://" DSNs work through the
+//          generic dbx.Open entry point.
+module mysql
+
+import "my_conn"
+import "my_pkt"
+import "my_type"
+import "my_dbx"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/errors"
+
+// Connect opens a connection from a parsed ConnInfo.
+// DSN form:
+//   mysql://[user[:pass]@]host[:port][/database][?tls=true|required]
+pub fn Connect(info: dbx_dsn.ConnInfo) -> (my_conn.MyConn, errors.Error) {
+    return my_conn.Connect(info)
+}
+
+// Dial parses a mysql:// DSN and connects.
+pub fn Dial(dsn: string) -> (my_conn.MyConn, errors.Error) {
+    info, err := dbx_dsn.ParseDSN(dsn)
+    if str.Len(err.message) > 0 {
+        return my_conn.MyConn{}, err
+    }
+    return my_conn.Connect(info)
+}
+
+// Query runs a text-protocol query (no parameters).
+pub fn Query(c: *my_conn.MyConn, sql: string) -> (my_conn.MyResult, errors.Error) {
+    return my_conn.Query(c, sql)
+}
+
+// QueryParams runs sql with bound '?' parameters via a prepared
+// statement (binary protocol).
+pub fn QueryParams(c: *my_conn.MyConn, sql: string, args: []dbx_value.Value) -> (my_conn.MyResult, errors.Error) {
+    return my_conn.QueryParams(c, sql, args)
+}
+
+// Exec runs sql and returns affected rows.
+pub fn Exec(c: *my_conn.MyConn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    return my_conn.Exec(c, sql, args)
+}
+
+// Register installs the driver into the dbx registry.
+pub fn Register() {
+    my_dbx.Register()
+}

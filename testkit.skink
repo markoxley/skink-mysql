@@ -1,0 +1,285 @@
+// File:    testkit.skink
+// Purpose: In-process fake MySQL backend for unit tests. Sends a
+//          protocol-41 handshake (mysql_native_password), accepts the
+//          client's handshake response with an OK packet, then for each
+//          command packet calls a responder fn that returns the
+//          response payloads to send (headers/sequence numbers are
+//          added automatically).
+//
+//          Kept out of the *_test.skink naming scheme on purpose — the
+//          suite harness treats every file matching *_test*.skink as a
+//          standalone test suite.
+module testkit
+
+import "std/str"
+import "std/libc"
+import "std/net"
+import "std/errors"
+import "std/waitgroup"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "my_pkt"
+
+// MyReq is one decoded client command handed to the responder.
+pub struct MyReq {
+    Cmd:     int      // command byte (3=query, 22=prepare, 23=execute, 14=ping, 2=initdb)
+    Sql:     string   // query / prepare text
+    Params:  []string // EXECUTE bound params (text form; "<NULL>" for SQL NULL)
+    StmtId:  int64    // EXECUTE statement id
+}
+
+// Pkt is one response payload (headers are added by the harness).
+pub struct Pkt {
+    Data: string
+    Len:  int
+}
+
+// FakeServer is a scripted MySQL backend on one loopback port.
+pub struct FakeServer {
+    listener: net.Connection
+    Port:     int
+}
+
+// ---- canned payload builders --------------------------------------------
+
+// wrap copies built buffer contents into a Pkt.
+fn wrap(b: *my_pkt.OutBuf) -> Pkt {
+    s, n := my_pkt.Data(b)
+    out := libc.malloc(n + 1)
+    libc.memcpy(out, s, n)
+    out[n] = 0
+    my_pkt.Free(b)
+    return Pkt{Data: out, Len: n}
+}
+
+// OKPkt builds an OK packet payload: 0x00, affected lenenc, lastid
+// lenenc, status u16, warnings u16.
+pub fn OKPkt(affected: int64, lastId: int64) -> Pkt {
+    b := my_pkt.NewOutBuf(16)
+    my_pkt.Byte(&b, 0)
+    my_pkt.LenencInt(&b, affected)
+    my_pkt.LenencInt(&b, lastId)
+    my_pkt.I16(&b, 2) // SERVER_STATUS_AUTOCOMMIT
+    my_pkt.I16(&b, 0)
+    return wrap(&b)
+}
+
+// ErrPkt builds an ERR packet: 0xff, errno u16, '#', sqlstate(5), msg.
+pub fn ErrPkt(code: int, state: string, msg: string) -> Pkt {
+    b := my_pkt.NewOutBuf(str.Len(msg) + 16)
+    my_pkt.Byte(&b, 255)
+    my_pkt.I16(&b, code)
+    my_pkt.Byte(&b, 35) // '#'
+    my_pkt.WriteN(&b, state, 5)
+    my_pkt.WriteN(&b, msg, str.Len(msg))
+    return wrap(&b)
+}
+
+// EOFPkt builds an EOF terminator: 0xfe, warnings u16, status u16.
+pub fn EOFPkt() -> Pkt {
+    b := my_pkt.NewOutBuf(5)
+    my_pkt.Byte(&b, 254)
+    my_pkt.I16(&b, 0)
+    my_pkt.I16(&b, 2)
+    return wrap(&b)
+}
+
+// ColDefPkt builds a ColumnDefinition41 payload.
+pub fn ColDefPkt(name: string, colType: int, flags: int) -> Pkt {
+    b := my_pkt.NewOutBuf(64)
+    my_pkt.LenencStr(&b, "def", 3)
+    my_pkt.LenencStr(&b, "", 0)     // schema
+    my_pkt.LenencStr(&b, "", 0)     // table
+    my_pkt.LenencStr(&b, "", 0)     // org_table
+    my_pkt.LenencStr(&b, name, str.Len(name))
+    my_pkt.LenencStr(&b, "", 0)     // org_name
+    my_pkt.LenencInt(&b, 12)        // fixed-length marker
+    my_pkt.I16(&b, 45)              // utf8mb4
+    my_pkt.I32(&b, int64(255))      // column length
+    my_pkt.Byte(&b, colType)
+    my_pkt.I16(&b, flags)
+    my_pkt.Byte(&b, 0)              // decimals
+    my_pkt.I16(&b, 0)               // reserved
+    return wrap(&b)
+}
+
+// TextRowPkt builds a text-protocol row from cells; nulls[i] marks NULL.
+pub fn TextRowPkt(cells: []string, nulls: []bool) -> Pkt {
+    b := my_pkt.NewOutBuf(32)
+    for i := 0; i < len(cells); i = i + 1 {
+        if nulls[i] {
+            my_pkt.Byte(&b, 251) // 0xfb NULL
+        } else {
+            my_pkt.LenencStr(&b, cells[i], str.Len(cells[i]))
+        }
+    }
+    return wrap(&b)
+}
+
+// ColCountPkt builds the lenenc column-count packet opening a result set.
+pub fn ColCountPkt(n: int) -> Pkt {
+    b := my_pkt.NewOutBuf(8)
+    my_pkt.LenencInt(&b, int64(n))
+    return wrap(&b)
+}
+
+// PrepareOKPkt builds the COM_STMT_PREPARE_OK response:
+// 0x00, stmt_id u32, num_cols u16, num_params u16, filler, warnings u16.
+pub fn PrepareOKPkt(stmtId: int64, numCols: int, numParams: int) -> Pkt {
+    b := my_pkt.NewOutBuf(16)
+    my_pkt.Byte(&b, 0)
+    my_pkt.I32(&b, stmtId)
+    my_pkt.I16(&b, numCols)
+    my_pkt.I16(&b, numParams)
+    my_pkt.Byte(&b, 0)
+    my_pkt.I16(&b, 0)
+    return wrap(&b)
+}
+
+// ---- server loop ----------------------------------------------------------
+
+// handshakePacket builds the server-greeting payload (seq 0).
+fn handshakePacket(salt1: string, salt2: string) -> Pkt {
+    b := my_pkt.NewOutBuf(96)
+    my_pkt.Byte(&b, 10)                 // protocol 10
+    my_pkt.CStr(&b, "8.0.33-fake")
+    my_pkt.I32(&b, int64(31337))        // connection id
+    my_pkt.WriteN(&b, salt1, 8)         // auth data part 1
+    my_pkt.Byte(&b, 0)                  // filler
+    my_pkt.I16(&b, 0xa685 & 65535)      // caps lower (incl. PROTOCOL_41/SECURE/PLUGIN)
+    my_pkt.Byte(&b, 45)                 // charset utf8mb4
+    my_pkt.I16(&b, 2)                   // status
+    my_pkt.I16(&b, 0)                   // caps upper
+    my_pkt.Byte(&b, 21)                 // auth plugin data len
+    for i := 0; i < 10; i = i + 1 {
+        my_pkt.Byte(&b, 0)              // reserved
+    }
+    my_pkt.WriteN(&b, salt2, 12)        // auth data part 2
+    my_pkt.Byte(&b, 0)
+    my_pkt.CStr(&b, "mysql_native_password")
+    return wrap(&b)
+}
+
+// decodeCommand inspects a client packet into a MyReq.
+fn decodeCommand(body: string, n: int) -> MyReq {
+    req := MyReq{}
+    if n == 0 {
+        return req
+    }
+    req.Cmd = body[0]
+    r := my_pkt.NewReader(body, n)
+    my_pkt.RByte(&r)
+    if req.Cmd == 3 || req.Cmd == 22 { // QUERY / STMT_PREPARE
+        s, _ := my_pkt.RRest(&r)
+        req.Sql = s
+    } else if req.Cmd == 2 { // INIT_DB
+        s, _ := my_pkt.RRest(&r)
+        req.Sql = s
+    } else if req.Cmd == 23 { // STMT_EXECUTE
+        req.StmtId = my_pkt.RI32(&r)
+        my_pkt.RByte(&r)   // flags
+        my_pkt.RI32(&r)    // iteration
+        // param decode: null bitmap + bound flag + types + values.
+        // We don't know the param count — the responder scripts it;
+        // capture values loosely when bound flag is set.
+        req.Params = decodeExecParams(&r)
+    }
+    return req
+}
+
+// execParams records the param count the last PREPARE declared so
+// decodeExecParams can walk EXECUTE frames. tests set it via
+// SetExecParamCount after returning a PrepareOKPkt.
+var execParamCount = 0
+
+// SetExecParamCount tells the decoder how many params the scripted
+// prepared statement takes (the fake has no real statement registry).
+pub fn SetExecParamCount(n: int) {
+    execParamCount = n
+}
+
+// decodeExecParams walks an EXECUTE tail: null bitmap + bound flag +
+// type pairs + lenenc values.
+fn decodeExecParams(r: *my_pkt.Reader) -> []string {
+    var params []string
+    np := execParamCount
+    if np <= 0 {
+        return params
+    }
+    bmpLen := (np + 7) / 8
+    bmpPos := r.Pos
+    r.Pos = r.Pos + bmpLen
+    bound := my_pkt.RByte(r)
+    if bound != 1 {
+        return params
+    }
+    // skip type pairs
+    r.Pos = r.Pos + np * 2
+    for i := 0; i < np; i = i + 1 {
+        if (r.Body[bmpPos + i / 8] & (1 << (i % 8))) != 0 {
+            params = append(params, "<NULL>")
+        } else {
+            s, _, isNull := my_pkt.RLenencStr(r)
+            if isNull {
+                params = append(params, "<NULL>")
+            } else {
+                params = append(params, s)
+            }
+        }
+    }
+    return params
+}
+
+// Serve accepts one connection and serves `turns` command packets.
+// Designed to run under `spawn`; signals the waitgroup when done.
+pub fn Serve(fs: *FakeServer, turns: int, respond: fn(MyReq) -> []Pkt, wg: *waitgroup.WaitGroup) {
+    conn, err := net.Accept(fs.listener)
+    if str.Len(err.message) > 0 {
+        waitgroup.Done(wg)
+        return
+    }
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", fs.Port)
+
+    // Handshake: send greeting (seq 0), read response (seq 1), reply OK.
+    hs := handshakePacket("salt0001", "salt0002")
+    sendPkt(&bc, 0, hs)
+    _, _, _, _ = my_pkt.Recv(&bc) // client handshake response
+    sendPkt(&bc, 2, OKPkt(0, 0))
+
+    for i := 0; i < turns; i = i + 1 {
+        body, n, _, rerr := my_pkt.Recv(&bc)
+        if str.Len(rerr.message) > 0 || n == 0 {
+            break
+        }
+        req := decodeCommand(body, n)
+        if req.Cmd == 1 { // COM_QUIT
+            break
+        }
+        script := respond(req)
+        if len(script) == 0 {
+            break
+        }
+        for j := 0; j < len(script); j = j + 1 {
+            sendPkt(&bc, j + 1, script[j])
+        }
+    }
+    bc.Close()
+    fs.listener.Close()
+    waitgroup.Done(wg)
+}
+
+// sendPkt writes one payload with the given sequence number.
+fn sendPkt(bc: *dbx_bufconn.BufConn, seq: int, p: Pkt) {
+    my_pkt.Send(bc, seq, p.Data, p.Len)
+}
+
+// StartFakeServer listens on the given loopback port and returns the
+// FakeServer plus an armed waitgroup — callers spawn Serve then dial.
+pub fn StartFakeServer(port: int) -> (FakeServer, *waitgroup.WaitGroup, errors.Error) {
+    listener, err := net.Listen("127.0.0.1", port)
+    if str.Len(err.message) > 0 {
+        return FakeServer{}, nil, err
+    }
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    return FakeServer{listener: listener, Port: port}, wg, errors.New("")
+}

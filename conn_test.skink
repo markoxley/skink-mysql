@@ -1,0 +1,209 @@
+// File:    conn_test.skink
+// Purpose: Integration tests for my_conn — handshake/auth against the
+//          scripted fake backend (testkit), COM_QUERY results,
+//          prepared-statement parameter binding, error packets, and
+//          transactions.
+module conn_test
+
+import "my_pkt"
+import "my_conn"
+import "my_type"
+import "testkit"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/libc"
+import "std/strconv"
+import "std/testing"
+import "std/waitgroup"
+import "std/errors"
+
+// lastReq records the last command the fake server received.
+var lastReq testkit.MyReq
+
+// qHandler answers COM_QUERY with a two-column one-row result.
+fn qHandler(req: testkit.MyReq) -> []testkit.Pkt {
+    lastReq = req
+    if req.Cmd == 3 { // COM_QUERY
+        return []testkit.Pkt{
+            testkit.ColCountPkt(2),
+            testkit.ColDefPkt("id", my_type.T_LONG, 0),
+            testkit.ColDefPkt("name", my_type.T_VAR_STRING, 0),
+            testkit.EOFPkt(),
+            testkit.TextRowPkt([]string{"7", "ada"}, []bool{false, false}),
+            testkit.TextRowPkt([]string{"8", ""}, []bool{false, true}),
+            testkit.EOFPkt(),
+        }
+    }
+    return []testkit.Pkt{testkit.OKPkt(0, 0)}
+}
+
+// TestConnectQuery covers handshake + COM_QUERY + text row decode.
+pub fn TestConnectQuery() {
+    fs, wg, serr := testkit.StartFakeServer(15601)
+    testing.AssertTrue(str.Len(serr.message) == 0, "fake server")
+    spawn testkit.Serve(&fs, 1, qHandler, wg)
+
+    info, _ := dbx_dsn.ParseDSN("mysql://user:pw@127.0.0.1:15601/db")
+    c, cerr := my_conn.Connect(info)
+    testing.AssertTrue(str.Len(cerr.message) == 0, str.Concat("connect: ", cerr.message))
+    testing.AssertEqualString("8.0.33-fake", c.ServerVer, "server version")
+    testing.AssertTrue(c.ConnID == int64(31337), "connection id")
+    testing.AssertEqualString("mysql_native_password", c.PluginName, "plugin")
+
+    res, qerr := my_conn.Query(&c, "SELECT id, name FROM users")
+    testing.AssertTrue(str.Len(qerr.message) == 0, str.Concat("query: ", qerr.message))
+    testing.AssertEqualInt(2, len(res.Columns), "columns")
+    testing.AssertEqualString("name", res.Columns[1], "col name")
+    testing.AssertEqualInt(2, len(res.Data), "rows")
+    testing.AssertTrue(res.Data[0][0].I64 == int64(7), "id int")
+    testing.AssertEqualString("ada", res.Data[0][1].Str, "name text")
+    testing.AssertTrue(dbx_value.IsNull(res.Data[1][1]), "NULL cell")
+    testing.AssertEqualString("SELECT id, name FROM users", lastReq.Sql, "sql on wire")
+    my_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// prepHandler answers PREPARE/EXECUTE; SetExecParamCount arms the
+// decoder for the scripted statement's arity.
+fn prepHandler(req: testkit.MyReq) -> []testkit.Pkt {
+    lastReq = req
+    if req.Cmd == 22 { // PREPARE
+        testkit.SetExecParamCount(2)
+        // PREPARE_OK then param defs + EOF then column defs + EOF.
+        return []testkit.Pkt{
+            testkit.PrepareOKPkt(int64(99), 1, 2),
+            testkit.ColDefPkt("p1", my_type.T_VAR_STRING, 0),
+            testkit.ColDefPkt("p2", my_type.T_VAR_STRING, 0),
+            testkit.EOFPkt(),
+            testkit.ColDefPkt("cnt", my_type.T_LONGLONG, 0),
+            testkit.EOFPkt(),
+        }
+    }
+    if req.Cmd == 23 { // EXECUTE
+        return []testkit.Pkt{
+            testkit.ColCountPkt(1),
+            testkit.ColDefPkt("cnt", my_type.T_LONGLONG, 0),
+            testkit.EOFPkt(),
+            binaryRow(1),
+            testkit.EOFPkt(),
+        }
+    }
+    return []testkit.Pkt{testkit.OKPkt(0, 0)}
+}
+
+// binaryRow builds a one-column LONGLONG binary-protocol row.
+fn binaryRow(v: int64) -> testkit.Pkt {
+    b := my_pkt.NewOutBuf(16)
+    my_pkt.Byte(&b, 0)
+    my_pkt.Byte(&b, 0) // null bitmap
+    my_pkt.I64(&b, v)
+    s, n := my_pkt.Data(&b)
+    out := libc.malloc(n + 1)
+    libc.memcpy(out, s, n)
+    out[n] = 0
+    my_pkt.Free(&b)
+    return testkit.Pkt{Data: out, Len: n}
+}
+
+// TestPreparedParams covers COM_STMT_PREPARE/EXECUTE binding and the
+// binary row protocol.
+pub fn TestPreparedParams() {
+    fs, wg, serr := testkit.StartFakeServer(15602)
+    testing.AssertTrue(str.Len(serr.message) == 0, "fake server")
+    spawn testkit.Serve(&fs, 2, prepHandler, wg)
+
+    info, _ := dbx_dsn.ParseDSN("mysql://user:pw@127.0.0.1:15602/db")
+    c, cerr := my_conn.Connect(info)
+    testing.AssertTrue(str.Len(cerr.message) == 0, "connect")
+
+    res, qerr := my_conn.QueryParams(&c, "SELECT count(*) FROM t WHERE a = ? AND b = ?",
+        []dbx_value.Value{dbx_value.Int(int64(5)), dbx_value.Null()})
+    testing.AssertTrue(str.Len(qerr.message) == 0, str.Concat("exec: ", qerr.message))
+    testing.AssertEqualInt(1, len(res.Data), "rows")
+    testing.AssertTrue(res.Data[0][0].I64 == int64(1), "binary longlong")
+    // wire-level: PREPARE carried the raw sql; EXECUTE carried params.
+    testing.AssertEqualInt(2, len(lastReq.Params), "param count on wire")
+    if len(lastReq.Params) == 2 {
+        testing.AssertEqualString("5", lastReq.Params[0], "param 1")
+        testing.AssertEqualString("<NULL>", lastReq.Params[1], "param 2 null")
+    }
+    my_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// errHandler answers COM_QUERY with an ERR packet.
+fn errHandler(req: testkit.MyReq) -> []testkit.Pkt {
+    lastReq = req
+    if req.Cmd == 3 {
+        return []testkit.Pkt{testkit.ErrPkt(1146, "42S02", "Table 'db.nope' doesn't exist")}
+    }
+    return []testkit.Pkt{testkit.OKPkt(0, 0)}
+}
+
+// TestErrorPacket maps ERR packets to errors.Error.
+pub fn TestErrorPacket() {
+    fs, wg, _ := testkit.StartFakeServer(15603)
+    spawn testkit.Serve(&fs, 1, errHandler, wg)
+    info, _ := dbx_dsn.ParseDSN("mysql://user:pw@127.0.0.1:15603/db")
+    c, _ := my_conn.Connect(info)
+    _, qerr := my_conn.Query(&c, "SELECT * FROM nope")
+    testing.AssertTrue(str.Len(qerr.message) > 0, "error surfaces")
+    testing.AssertContains(qerr.message, "1146", "errno")
+    testing.AssertContains(qerr.message, "42S02", "sqlstate")
+    testing.AssertContains(qerr.message, "doesn't exist", "message")
+    my_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// txHandler answers BEGIN/COMMIT/ROLLBACK with OK.
+fn txHandler(req: testkit.MyReq) -> []testkit.Pkt {
+    lastReq = req
+    return []testkit.Pkt{testkit.OKPkt(0, 0)}
+}
+
+// TestTxFlow covers Begin/Commit/Rollback command mapping.
+pub fn TestTxFlow() {
+    fs, wg, _ := testkit.StartFakeServer(15604)
+    spawn testkit.Serve(&fs, 3, txHandler, wg)
+    info, _ := dbx_dsn.ParseDSN("mysql://user:pw@127.0.0.1:15604/db")
+    c, _ := my_conn.Connect(info)
+    berr := my_conn.Begin(&c)
+    testing.AssertTrue(str.Len(berr.message) == 0, "begin")
+    testing.AssertEqualString("BEGIN", lastReq.Sql, "BEGIN on wire")
+    cerr := my_conn.CommitTx(&c)
+    testing.AssertTrue(str.Len(cerr.message) == 0, "commit")
+    testing.AssertEqualString("COMMIT", lastReq.Sql, "COMMIT on wire")
+    my_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// TestPing covers COM_PING.
+pub fn TestPing() {
+    fs, wg, _ := testkit.StartFakeServer(15605)
+    spawn testkit.Serve(&fs, 1, txHandler, wg)
+    info, _ := dbx_dsn.ParseDSN("mysql://user:pw@127.0.0.1:15605/db")
+    c, _ := my_conn.Connect(info)
+    perr := my_conn.Ping(&c)
+    testing.AssertTrue(str.Len(perr.message) == 0, "ping")
+    testing.AssertEqualInt(14, lastReq.Cmd, "COM_PING on wire")
+    my_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// TestInterpolateSkipsComments — regression: '?' inside --, #, /* */
+// comments and ""/`` quotes must not consume bound arguments, which
+// would shift every later placeholder.
+pub fn TestInterpolateSkipsComments() {
+    two := []dbx_value.Value{dbx_value.Int(int64(1)), dbx_value.Int(int64(2))}
+    got := my_conn.interpolate("SELECT ? -- ?\n, ?", two)
+    testing.AssertEqualString("SELECT 1 -- ?\n, 2", got, "line comment skipped")
+    got = my_conn.interpolate("SELECT ? # ?\n, ?", two)
+    testing.AssertEqualString("SELECT 1 # ?\n, 2", got, "hash comment skipped")
+    got = my_conn.interpolate("SELECT ? /* ? */ , ?", two)
+    testing.AssertEqualString("SELECT 1 /* ? */ , 2", got, "block comment skipped")
+    got = my_conn.interpolate("SELECT \"?\", ?", two)
+    testing.AssertEqualString("SELECT \"?\", 1", got, "double-quoted skipped")
+    got = my_conn.interpolate("SELECT `?`, ?", two)
+    testing.AssertEqualString("SELECT `?`, 1", got, "backtick identifier skipped")
+}

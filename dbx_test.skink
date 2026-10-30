@@ -1,0 +1,109 @@
+// File:    dbx_test.skink
+// Purpose: Tests for the my_dbx adapter — driver registration,
+//          dbx.Open dispatch, prepared-statement parameter binding, and
+//          transaction mapping to BEGIN/COMMIT.
+module dbx_test
+
+import "my_conn"
+import "my_type"
+import "my_dbx"
+import "testkit"
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "mod/markoxley/skink-dbx/dbx_rows"
+import "std/str"
+import "std/strconv"
+import "std/testing"
+import "std/waitgroup"
+import "std/errors"
+import "std/libc"
+
+var lastSql string
+var lastParams []string
+
+// dbxHandler drives PREPARE/EXECUTE for parameterised queries and
+// COM_QUERY for everything else.
+fn dbxHandler(req: testkit.MyReq) -> []testkit.Pkt {
+    if req.Cmd == 22 { // PREPARE
+        lastSql = req.Sql
+        testkit.SetExecParamCount(2)
+        return []testkit.Pkt{
+            testkit.PrepareOKPkt(int64(7), 1, 2),
+            testkit.ColDefPkt("p1", my_type.T_VAR_STRING, 0),
+            testkit.ColDefPkt("p2", my_type.T_VAR_STRING, 0),
+            testkit.EOFPkt(),
+            testkit.ColDefPkt("cnt", my_type.T_LONGLONG, 0),
+            testkit.EOFPkt(),
+        }
+    }
+    if req.Cmd == 23 { // EXECUTE
+        lastParams = req.Params
+        return []testkit.Pkt{
+            testkit.ColCountPkt(1),
+            testkit.ColDefPkt("cnt", my_type.T_LONGLONG, 0),
+            testkit.EOFPkt(),
+            binRow(),
+            testkit.EOFPkt(),
+        }
+    }
+    if req.Cmd == 3 { // COM_QUERY
+        lastSql = req.Sql
+        return []testkit.Pkt{testkit.OKPkt(0, 0)}
+    }
+    return []testkit.Pkt{testkit.OKPkt(0, 0)}
+}
+
+fn binRow() -> testkit.Pkt {
+    b := my_pkt.NewOutBuf(16)
+    my_pkt.Byte(&b, 0)
+    my_pkt.Byte(&b, 0)
+    my_pkt.I64(&b, int64(88))
+    s, n := my_pkt.Data(&b)
+    out := libc.malloc(n + 1)
+    libc.memcpy(out, s, n)
+    out[n] = 0
+    my_pkt.Free(&b)
+    return testkit.Pkt{Data: out, Len: n}
+}
+
+// TestOpenQuery runs dbx.Open → Conn.Query through the fake backend.
+pub fn TestOpenQuery() {
+    lastSql = ""
+    lastParams = []string{}
+    fs, wg, _ := testkit.StartFakeServer(15611)
+    spawn testkit.Serve(&fs, 2, dbxHandler, wg)
+
+    my_dbx.Register()
+    conn, err := dbx_driver.Open("mysql://u:p@127.0.0.1:15611/db")
+    testing.AssertTrue(str.Len(err.message) == 0, str.Concat("open: ", err.message))
+    testing.AssertEqualString("mysql", conn.Name, "driver name")
+
+    rows, qerr := conn.Query("SELECT count(*) FROM t WHERE a = ? AND b = ?",
+        []dbx_value.Value{dbx_value.Int(int64(5)), dbx_value.Text("x")})
+    testing.AssertTrue(str.Len(qerr.message) == 0, str.Concat("query: ", qerr.message))
+    testing.AssertTrue(rows.Next(), "has row")
+    testing.AssertTrue(rows.Int64("cnt") == int64(88), "cnt value")
+    // '?' stayed '?' — bound via the binary protocol.
+    testing.AssertEqualString("SELECT count(*) FROM t WHERE a = ? AND b = ?", lastSql, "sql verbatim")
+    testing.AssertEqualString("5", lastParams[0], "param 1")
+    testing.AssertEqualString("x", lastParams[1], "param 2")
+    conn.Close()
+    waitgroup.Wait(wg)
+}
+
+// TestTxMapping covers dbx Tx → BEGIN/COMMIT on the wire (COM_QUERY).
+pub fn TestTxMapping() {
+    fs, wg, _ := testkit.StartFakeServer(15612)
+    spawn testkit.Serve(&fs, 2, dbxHandler, wg)
+    my_dbx.Register()
+    conn, err := dbx_driver.Open("mysql://u:p@127.0.0.1:15612/db")
+    testing.AssertTrue(str.Len(err.message) == 0, "open")
+    tx, terr := conn.Begin()
+    testing.AssertTrue(str.Len(terr.message) == 0, "begin")
+    testing.AssertEqualString("BEGIN", lastSql, "BEGIN sent")
+    cerr := tx.Commit()
+    testing.AssertTrue(str.Len(cerr.message) == 0, "commit")
+    testing.AssertEqualString("COMMIT", lastSql, "COMMIT sent")
+    conn.Close()
+    waitgroup.Wait(wg)
+}

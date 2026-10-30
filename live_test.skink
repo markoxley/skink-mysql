@@ -1,0 +1,159 @@
+// File:    live_test.skink
+// Purpose: Live integration test for skink-mysql against a real
+//          MySQL 8 server. Skipped (exit 0) unless SKINK_MYSQL_DSN is
+//          set — test_live.sh starts a podman mysql:8.0 container and
+//          exports it.
+//
+//          Exercises the full protocol for real: handshake +
+//          caching_sha2_password (MySQL 8 default) and
+//          mysql_native_password (after ALTER USER), COM_QUERY,
+//          prepared statements with bound params (binary protocol),
+//          type decoding (int/varchar/double/datetime/blob), affected
+//          rows, transactions, error packets, and ping.
+module main
+
+import "my_conn"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/os"
+import "std/errors"
+
+var failures = 0
+
+// check reports a boolean assertion.
+fn check(ok: bool, what: string) {
+    if !ok {
+        println("FAIL:", what)
+        failures = failures + 1
+    }
+}
+
+// expectErr asserts an errors.Error is empty.
+fn expectErr(e: errors.Error, what: string) {
+    if str.Len(e.message) > 0 {
+        check(false, str.Concat(what, str.Concat(" -> ", e.message)))
+    }
+}
+
+fn main() -> int {
+    dsn := os.Getenv("SKINK_MYSQL_DSN")
+    if str.Len(dsn) == 0 {
+        println("SKIP live_test: SKINK_MYSQL_DSN not set")
+        return 0
+    }
+    println("live test against", dsn)
+
+    info, perr := dbx_dsn.ParseDSN(dsn)
+    if str.Len(perr.message) > 0 {
+        println("FAIL: dsn parse", perr.message)
+        return 1
+    }
+    c, err := my_conn.Connect(info)
+    expectErr(err, "connect (caching_sha2_password on mysql:8)")
+    if str.Len(err.message) > 0 {
+        return 1
+    }
+    check(str.Len(c.ServerVer) > 0, "server version reported")
+    check(str.Len(c.PluginName) > 0, str.Concat("plugin: ", c.PluginName))
+
+    // Setup table.
+    _, e1 := my_conn.Exec(&c, "DROP TABLE IF EXISTS skink_live", []dbx_value.Value{})
+    expectErr(e1, "drop")
+    _, e2 := my_conn.Exec(&c,
+        "CREATE TABLE skink_live (id int auto_increment primary key, name varchar(64), score double, created datetime(6), data blob)",
+        []dbx_value.Value{})
+    expectErr(e2, "create")
+
+    // Parameterized insert via prepared statement (binary protocol).
+    a1, e3 := my_conn.Exec(&c,
+        "INSERT INTO skink_live (name, score, created, data) VALUES (?, ?, ?, ?)",
+        []dbx_value.Value{
+            dbx_value.Text("alpha"),
+            dbx_value.Float(9.5),
+            dbx_value.TimeUnixMicros(int64(1709258400123456)),
+            dbx_value.Blob("xyz", 3),
+        })
+    expectErr(e3, "insert")
+    check(a1 == int64(1), "insert affected 1")
+
+    // Select back with a bound predicate.
+    res, e4 := my_conn.QueryParams(&c,
+        "SELECT id, name, score, created, data FROM skink_live WHERE name = ?",
+        []dbx_value.Value{dbx_value.Text("alpha")})
+    expectErr(e4, "select")
+    check(len(res.Data) == 1, "one row")
+    if len(res.Data) == 1 {
+        r := res.Data[0]
+        check(r[0].Kind == dbx_value.KIND_INT && r[0].I64 == int64(1), "id int")
+        check(str.Equal(r[1].Str, "alpha"), "name text")
+        check(r[2].Kind == dbx_value.KIND_FLOAT && r[2].F64 == 9.5, "score double")
+        check(r[4].Kind == dbx_value.KIND_BLOB && r[4].Len == 3, "data blob")
+        // datetime(6) decodes to micros in binary protocol.
+        if r[3].Kind == dbx_value.KIND_TIME {
+            check(r[3].I64 == int64(1709258400123456), "created micros")
+        } else {
+            println("note: datetime decoded as kind", r[3].Kind, "->", r[3].Str)
+        }
+    }
+
+    // Text-protocol query: count(*) is LONGLONG.
+    res2, e5 := my_conn.Query(&c, "SELECT count(*) FROM skink_live")
+    expectErr(e5, "count")
+    if len(res2.Data) == 1 {
+        check(res2.Data[0][0].Kind == dbx_value.KIND_INT && res2.Data[0][0].I64 == int64(1), "count int")
+    }
+
+    // Transaction rollback discards the row.
+    expectErr(my_conn.Begin(&c), "begin")
+    _, e6 := my_conn.Exec(&c, "INSERT INTO skink_live (name) VALUES ('rolledback')", []dbx_value.Value{})
+    expectErr(e6, "insert in tx")
+    expectErr(my_conn.RollbackTx(&c), "rollback")
+    res3, _ := my_conn.Query(&c, "SELECT count(*) FROM skink_live")
+    check(res3.Data[0][0].I64 == int64(1), "rollback discarded row")
+
+    // Error surfaces and connection recovers.
+    _, e7 := my_conn.Exec(&c, "SELECT * FROM no_such_table", []dbx_value.Value{})
+    check(str.Len(e7.message) > 0, "error surfaces")
+    check(str.Contains(e7.message, "1146"), "errno 1146")
+    res4, e8 := my_conn.Query(&c, "SELECT 1")
+    expectErr(e8, "usable after error")
+    check(len(res4.Data) == 1, "SELECT 1 ok")
+
+    expectErr(my_conn.Ping(&c), "ping")
+    expectErr(my_conn.Close(&c), "close")
+
+    // Second user round-trip: switch to mysql_native_password when
+    // SKINK_MYSQL_ROOT_DSN gives us a root connection to ALTER USER.
+    rootDsn := os.Getenv("SKINK_MYSQL_ROOT_DSN")
+    if str.Len(rootDsn) > 0 {
+        rinfo, _ := dbx_dsn.ParseDSN(rootDsn)
+        rc, rerr := my_conn.Connect(rinfo)
+        expectErr(rerr, "root connect")
+        if str.Len(rerr.message) == 0 {
+            _, aerr := my_conn.Exec(&rc,
+                "ALTER USER 'skink'@'%' IDENTIFIED WITH mysql_native_password BY 'skinktest'",
+                []dbx_value.Value{})
+            expectErr(aerr, "alter user to native")
+            my_conn.Close(&rc)
+            if str.Len(aerr.message) == 0 {
+                nc, nerr := my_conn.Connect(info)
+                expectErr(nerr, "reconnect (mysql_native_password)")
+                if str.Len(nerr.message) == 0 {
+                    check(str.Equal(nc.PluginName, "mysql_native_password"), "native plugin negotiated")
+                    res5, e9 := my_conn.Query(&nc, "SELECT count(*) FROM skink_live")
+                    expectErr(e9, "native-auth query")
+                    check(res5.Data[0][0].I64 == int64(1), "native-auth count")
+                    my_conn.Close(&nc)
+                }
+            }
+        }
+    }
+
+    if failures > 0 {
+        println("FAILURES:", failures)
+        return 1
+    }
+    println("live test OK")
+    return 0
+}

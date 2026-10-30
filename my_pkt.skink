@@ -1,0 +1,366 @@
+// File:    my_pkt.skink
+// Purpose: MySQL/MariaDB wire framing. Every packet is a 3-byte
+//          little-endian payload length + 1-byte sequence number +
+//          payload; payloads ≥ 16 MiB are continued in follow-on
+//          packets. Integers are little-endian; length-encoded
+//          integers/strings (lenenc) prefix variable-width data.
+//
+//          Payloads are binary, so all encode/decode runs through the
+//          explicit-length OutBuf/ByteReader pair — strlen-based string
+//          helpers would truncate at interior NUL bytes.
+module my_pkt
+
+import "std/str"
+import "std/libc"
+import "std/errors"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+
+// Packet header size and the lenenc markers.
+pub const HDR_LEN = 4
+pub const ENC_NULL  = 251 // 0xfb — NULL column / 8-byte follows elsewhere
+pub const ENC_INT2  = 252 // 0xfc
+pub const ENC_INT3  = 253 // 0xfd
+pub const ENC_INT8  = 254 // 0xfe
+
+// ---- output buffer -----------------------------------------------------
+
+// OutBuf is a growable byte buffer for packet payloads.
+pub struct OutBuf {
+    Buf: string
+    Len: int
+    Cap: int
+}
+
+// NewOutBuf allocates a buffer with the given initial capacity.
+pub fn NewOutBuf(cap: int) -> OutBuf {
+    return OutBuf{Buf: libc.malloc(cap + 1), Len: 0, Cap: cap + 1}
+}
+
+fn grow(b: *OutBuf, n: int) {
+    if b.Len + n + 1 <= b.Cap {
+        return
+    }
+    nc := b.Cap * 2
+    if nc < b.Len + n + 1 {
+        nc = b.Len + n + 1
+    }
+    nb := libc.malloc(nc)
+    libc.memcpy(nb, b.Buf, b.Len)
+    libc.free(b.Buf)
+    b.Buf = nb
+    b.Cap = nc
+}
+
+// Byte appends one byte.
+pub fn Byte(b: *OutBuf, v: int) {
+    grow(b, 1)
+    b.Buf[b.Len] = v & 255
+    b.Len = b.Len + 1
+    b.Buf[b.Len] = 0
+}
+
+// I16 appends a little-endian uint16.
+pub fn I16(b: *OutBuf, v: int) {
+    Byte(b, v & 255)
+    Byte(b, (v >> 8) & 255)
+}
+
+// I32 appends a little-endian uint32.
+pub fn I32(b: *OutBuf, v: int64) {
+    Byte(b, int(v & 255))
+    Byte(b, int((v >> 8) & 255))
+    Byte(b, int((v >> 16) & 255))
+    Byte(b, int((v >> 24) & 255))
+}
+
+// I64 appends a little-endian uint64.
+pub fn I64(b: *OutBuf, v: int64) {
+    for i := 0; i < 8; i = i + 1 {
+        Byte(b, int((v >> (i * 8)) & 255))
+    }
+}
+
+// CStr appends a NUL-terminated string.
+pub fn CStr(b: *OutBuf, s: string) {
+    n := str.Len(s)
+    grow(b, n + 1)
+    libc.memcpy(string(int64(b.Buf) + int64(b.Len)), s, n + 1)
+    b.Len = b.Len + n + 1
+}
+
+// WriteN appends n bytes — binary-safe.
+pub fn WriteN(b: *OutBuf, s: string, n: int) {
+    if n <= 0 {
+        return
+    }
+    grow(b, n)
+    libc.memcpy(string(int64(b.Buf) + int64(b.Len)), s, n)
+    b.Len = b.Len + n
+    b.Buf[b.Len] = 0
+}
+
+// LenencInt appends a length-encoded integer.
+pub fn LenencInt(b: *OutBuf, v: int64) {
+    if v < int64(251) {
+        Byte(b, int(v))
+    } else if v < int64(65536) {
+        Byte(b, ENC_INT2)
+        I16(b, int(v))
+    } else if v < int64(16777216) {
+        Byte(b, ENC_INT3)
+        Byte(b, int(v & 255))
+        Byte(b, int((v >> 8) & 255))
+        Byte(b, int((v >> 16) & 255))
+    } else {
+        Byte(b, ENC_INT8)
+        I64(b, v)
+    }
+}
+
+// LenencStr appends a length-prefixed string.
+pub fn LenencStr(b: *OutBuf, s: string, n: int) {
+    LenencInt(b, int64(n))
+    WriteN(b, s, n)
+}
+
+// Data returns the accumulated bytes + length.
+pub fn Data(b: *OutBuf) -> (string, int) {
+    return b.Buf, b.Len
+}
+
+// Free releases the buffer.
+pub fn Free(b: *OutBuf) {
+    if int64(b.Buf) != 0 {
+        libc.free(b.Buf)
+    }
+    b.Buf = ""
+    b.Len = 0
+    b.Cap = 0
+}
+
+// ---- packet I/O ---------------------------------------------------------
+
+// Send writes one packet with the given sequence number.
+pub fn Send(c: *dbx_bufconn.BufConn, seq: int, payload: string, n: int) -> errors.Error {
+    hdr := libc.malloc(4)
+    hdr[0] = n & 255
+    hdr[1] = (n >> 8) & 255
+    hdr[2] = (n >> 16) & 255
+    hdr[3] = seq & 255
+    err := c.WriteAll(hdr, 4)
+    libc.free(hdr)
+    if str.Len(err.message) == 0 && n > 0 {
+        err = c.WriteAll(payload, n)
+    }
+    return err
+}
+
+// Recv reads one packet's payload, returning data + exact byte length +
+// sequence number. Continuation packets (each a full 16 MiB chunk) are
+// joined transparently; `total` tracks bytes since payloads are binary
+// and cannot be strlen-measured.
+pub fn Recv(c: *dbx_bufconn.BufConn) -> (string, int, int, errors.Error) {
+    hdr, herr := c.ReadN(4)
+    if str.Len(herr.message) > 0 {
+        return "", 0, 0, herr
+    }
+    n := hdr[0] | (hdr[1] << 8) | (hdr[2] << 16)
+    seq := hdr[3]
+    if n == 0 {
+        return "", 0, seq, errors.New("")
+    }
+    body, berr := c.ReadN(n)
+    if str.Len(berr.message) > 0 {
+        return "", 0, seq, berr
+    }
+    total := n
+    for n == 16777215 { // each continuation is a full 16 MiB chunk
+        hdr, herr = c.ReadN(4)
+        if str.Len(herr.message) > 0 {
+            return "", 0, seq, herr
+        }
+        n = hdr[0] | (hdr[1] << 8) | (hdr[2] << 16)
+        if n <= 0 {
+            break
+        }
+        more, merr := c.ReadN(n)
+        if str.Len(merr.message) > 0 {
+            return "", 0, seq, merr
+        }
+        joined := libc.malloc(total + n + 1)
+        libc.memcpy(joined, body, total)
+        libc.memcpy(string(int64(joined) + int64(total)), more, n)
+        joined[total + n] = 0
+        libc.free(body)
+        libc.free(more)
+        body = joined
+        total = total + n
+    }
+    return body, total, seq, errors.New("")
+}
+
+// ---- payload cursor -----------------------------------------------------
+
+// Reader walks a packet payload field-by-field. All reads return raw
+// little-endian values; strings carry explicit lengths.
+pub struct Reader {
+    Body: string
+    Len:  int
+    Pos:  int
+}
+
+// NewReader wraps a payload for decoding.
+pub fn NewReader(body: string, bodyLen: int) -> Reader {
+    return Reader{Body: body, Len: bodyLen, Pos: 0}
+}
+
+// Remaining reports unread bytes.
+pub fn Remaining(r: *Reader) -> int {
+    return r.Len - r.Pos
+}
+
+// RByte reads one byte, -1 when exhausted.
+pub fn RByte(r: *Reader) -> int {
+    if r.Pos >= r.Len {
+        return -1
+    }
+    v := r.Body[r.Pos]
+    r.Pos = r.Pos + 1
+    return v
+}
+
+// RI16 reads a little-endian uint16.
+pub fn RI16(r: *Reader) -> int {
+    if r.Pos + 2 > r.Len {
+        return -1
+    }
+    v := r.Body[r.Pos] | (r.Body[r.Pos + 1] << 8)
+    r.Pos = r.Pos + 2
+    return v
+}
+
+// RI32 reads a little-endian uint32.
+pub fn RI32(r: *Reader) -> int64 {
+    if r.Pos + 4 > r.Len {
+        return int64(-1)
+    }
+    v := int64(r.Body[r.Pos]) |
+        (int64(r.Body[r.Pos + 1]) << 8) |
+        (int64(r.Body[r.Pos + 2]) << 16) |
+        (int64(r.Body[r.Pos + 3]) << 24)
+    r.Pos = r.Pos + 4
+    return v
+}
+
+// RI64 reads a little-endian uint64.
+pub fn RI64(r: *Reader) -> int64 {
+    v := int64(0)
+    for i := 0; i < 8; i = i + 1 {
+        if r.Pos >= r.Len {
+            return int64(-1)
+        }
+        v = v | (int64(r.Body[r.Pos]) << (i * 8))
+        r.Pos = r.Pos + 1
+    }
+    return v
+}
+
+// RLenenc reads a length-encoded integer. Returns (value, isNull) —
+// 0xfb in a row payload marks SQL NULL, surfaced here as isNull.
+pub fn RLenenc(r: *Reader) -> (int64, bool) {
+    first := RByte(r)
+    if first < 0 {
+        return int64(0), true
+    }
+    if first == ENC_NULL {
+        return int64(0), true
+    }
+    if first < 251 {
+        return int64(first), false
+    }
+    if first == ENC_INT2 {
+        return int64(RI16(r)), false
+    }
+    if first == ENC_INT3 {
+        v := int64(0)
+        for i := 0; i < 3; i = i + 1 {
+            if r.Pos >= r.Len {
+                return int64(0), true
+            }
+            v = v | (int64(r.Body[r.Pos]) << (i * 8))
+            r.Pos = r.Pos + 1
+        }
+        return v, false
+    }
+    // 0xfe / 0xff → 8-byte
+    return RI64(r), false
+}
+
+// RLenencStr reads a length-encoded string, returning (data, len,
+// isNull).
+pub fn RLenencStr(r: *Reader) -> (string, int, bool) {
+    n, isNull := RLenenc(r)
+    if isNull {
+        return "", 0, true
+    }
+    ln := int(n)
+    if ln < 0 || r.Pos + ln > r.Len {
+        ln = r.Len - r.Pos
+        if ln < 0 {
+            ln = 0
+        }
+    }
+    out := libc.malloc(ln + 1)
+    if ln > 0 {
+        libc.memcpy(out, string(int64(r.Body) + int64(r.Pos)), ln)
+    }
+    out[ln] = 0
+    r.Pos = r.Pos + ln
+    return out, ln, false
+}
+
+// RCStr reads a NUL-terminated string.
+pub fn RCStr(r: *Reader) -> string {
+    start := r.Pos
+    for r.Pos < r.Len && r.Body[r.Pos] != 0 {
+        r.Pos = r.Pos + 1
+    }
+    n := r.Pos - start
+    out := libc.malloc(n + 1)
+    if n > 0 {
+        libc.memcpy(out, string(int64(r.Body) + int64(start)), n)
+    }
+    out[n] = 0
+    if r.Pos < r.Len {
+        r.Pos = r.Pos + 1 // skip NUL
+    }
+    return out
+}
+
+// RRest returns the remaining bytes as a string + length.
+pub fn RRest(r: *Reader) -> (string, int) {
+    n := r.Len - r.Pos
+    if n <= 0 {
+        return "", 0
+    }
+    out := libc.malloc(n + 1)
+    libc.memcpy(out, string(int64(r.Body) + int64(r.Pos)), n)
+    out[n] = 0
+    r.Pos = r.Len
+    return out, n
+}
+
+// RBytes reads n raw bytes (may contain NULs); returns data + length.
+pub fn RBytes(r: *Reader, n: int) -> (string, int) {
+    if n < 0 || r.Pos >= r.Len {
+        return "", 0
+    }
+    if r.Pos + n > r.Len {
+        n = r.Len - r.Pos
+    }
+    out := libc.malloc(n + 1)
+    libc.memcpy(out, string(int64(r.Body) + int64(r.Pos)), n)
+    out[n] = 0
+    r.Pos = r.Pos + n
+    return out, n
+}
