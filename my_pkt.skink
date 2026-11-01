@@ -15,6 +15,13 @@ import "std/libc"
 import "std/errors"
 import "mod/markoxley/skink-dbx/dbx_bufconn"
 
+// Raw byte accessors for malloc'd wire buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside binary protocol data.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // Packet header size and the lenenc markers.
 pub const HDR_LEN = 4
 pub const ENC_NULL  = 251 // 0xfb — NULL column / 8-byte follows elsewhere
@@ -54,9 +61,9 @@ fn grow(b: *OutBuf, n: int) {
 // Byte appends one byte.
 pub fn Byte(b: *OutBuf, v: int) {
     grow(b, 1)
-    b.Buf[b.Len] = v & 255
+    Skink_mem_write_byte(b.Buf, int64(b.Len), v & 255)
     b.Len = b.Len + 1
-    b.Buf[b.Len] = 0
+    Skink_mem_write_byte(b.Buf, int64(b.Len), 0)
 }
 
 // I16 appends a little-endian uint16.
@@ -96,7 +103,7 @@ pub fn WriteN(b: *OutBuf, s: string, n: int) {
     grow(b, n)
     libc.memcpy(string(int64(b.Buf) + int64(b.Len)), s, n)
     b.Len = b.Len + n
-    b.Buf[b.Len] = 0
+    Skink_mem_write_byte(b.Buf, int64(b.Len), 0)
 }
 
 // LenencInt appends a length-encoded integer.
@@ -143,10 +150,10 @@ pub fn Free(b: *OutBuf) {
 // Send writes one packet with the given sequence number.
 pub fn Send(c: *dbx_bufconn.BufConn, seq: int, payload: string, n: int) -> errors.Error {
     hdr := libc.malloc(4)
-    hdr[0] = n & 255
-    hdr[1] = (n >> 8) & 255
-    hdr[2] = (n >> 16) & 255
-    hdr[3] = seq & 255
+    Skink_mem_write_byte(hdr, int64(0), n & 255)
+    Skink_mem_write_byte(hdr, int64(1), (n >> 8) & 255)
+    Skink_mem_write_byte(hdr, int64(2), (n >> 16) & 255)
+    Skink_mem_write_byte(hdr, int64(3), seq & 255)
     err := c.WriteAll(hdr, 4)
     libc.free(hdr)
     if str.Len(err.message) == 0 && n > 0 {
@@ -164,8 +171,8 @@ pub fn Recv(c: *dbx_bufconn.BufConn) -> (string, int, int, errors.Error) {
     if str.Len(herr.message) > 0 {
         return "", 0, 0, herr
     }
-    n := hdr[0] | (hdr[1] << 8) | (hdr[2] << 16)
-    seq := hdr[3]
+    n := Skink_mem_byte(hdr, int64(0)) | (Skink_mem_byte(hdr, int64(1)) << 8) | (Skink_mem_byte(hdr, int64(2)) << 16)
+    seq := Skink_mem_byte(hdr, int64(3))
     if n == 0 {
         return "", 0, seq, errors.New("")
     }
@@ -179,7 +186,7 @@ pub fn Recv(c: *dbx_bufconn.BufConn) -> (string, int, int, errors.Error) {
         if str.Len(herr.message) > 0 {
             return "", 0, seq, herr
         }
-        n = hdr[0] | (hdr[1] << 8) | (hdr[2] << 16)
+        n = Skink_mem_byte(hdr, int64(0)) | (Skink_mem_byte(hdr, int64(1)) << 8) | (Skink_mem_byte(hdr, int64(2)) << 16)
         if n <= 0 {
             break
         }
@@ -190,7 +197,7 @@ pub fn Recv(c: *dbx_bufconn.BufConn) -> (string, int, int, errors.Error) {
         joined := libc.malloc(total + n + 1)
         libc.memcpy(joined, body, total)
         libc.memcpy(string(int64(joined) + int64(total)), more, n)
-        joined[total + n] = 0
+        Skink_mem_write_byte(joined, int64(total + n), 0)
         libc.free(body)
         libc.free(more)
         body = joined
@@ -224,7 +231,7 @@ pub fn RByte(r: *Reader) -> int {
     if r.Pos >= r.Len {
         return -1
     }
-    v := r.Body[r.Pos]
+    v := Skink_mem_byte(r.Body, int64(r.Pos))
     r.Pos = r.Pos + 1
     return v
 }
@@ -234,7 +241,7 @@ pub fn RI16(r: *Reader) -> int {
     if r.Pos + 2 > r.Len {
         return -1
     }
-    v := r.Body[r.Pos] | (r.Body[r.Pos + 1] << 8)
+    v := Skink_mem_byte(r.Body, int64(r.Pos)) | (Skink_mem_byte(r.Body, int64(r.Pos + 1)) << 8)
     r.Pos = r.Pos + 2
     return v
 }
@@ -244,10 +251,10 @@ pub fn RI32(r: *Reader) -> int64 {
     if r.Pos + 4 > r.Len {
         return int64(-1)
     }
-    v := int64(r.Body[r.Pos]) |
-        (int64(r.Body[r.Pos + 1]) << 8) |
-        (int64(r.Body[r.Pos + 2]) << 16) |
-        (int64(r.Body[r.Pos + 3]) << 24)
+    v := int64(Skink_mem_byte(r.Body, int64(r.Pos))) |
+        (int64(Skink_mem_byte(r.Body, int64(r.Pos + 1))) << 8) |
+        (int64(Skink_mem_byte(r.Body, int64(r.Pos + 2))) << 16) |
+        (int64(Skink_mem_byte(r.Body, int64(r.Pos + 3))) << 24)
     r.Pos = r.Pos + 4
     return v
 }
@@ -259,7 +266,7 @@ pub fn RI64(r: *Reader) -> int64 {
         if r.Pos >= r.Len {
             return int64(-1)
         }
-        v = v | (int64(r.Body[r.Pos]) << (i * 8))
+        v = v | (int64(Skink_mem_byte(r.Body, int64(r.Pos))) << (i * 8))
         r.Pos = r.Pos + 1
     }
     return v
@@ -287,7 +294,7 @@ pub fn RLenenc(r: *Reader) -> (int64, bool) {
             if r.Pos >= r.Len {
                 return int64(0), true
             }
-            v = v | (int64(r.Body[r.Pos]) << (i * 8))
+            v = v | (int64(Skink_mem_byte(r.Body, int64(r.Pos))) << (i * 8))
             r.Pos = r.Pos + 1
         }
         return v, false
@@ -314,7 +321,7 @@ pub fn RLenencStr(r: *Reader) -> (string, int, bool) {
     if ln > 0 {
         libc.memcpy(out, string(int64(r.Body) + int64(r.Pos)), ln)
     }
-    out[ln] = 0
+    Skink_mem_write_byte(out, int64(ln), 0)
     r.Pos = r.Pos + ln
     return out, ln, false
 }
@@ -322,7 +329,7 @@ pub fn RLenencStr(r: *Reader) -> (string, int, bool) {
 // RCStr reads a NUL-terminated string.
 pub fn RCStr(r: *Reader) -> string {
     start := r.Pos
-    for r.Pos < r.Len && r.Body[r.Pos] != 0 {
+    for r.Pos < r.Len && Skink_mem_byte(r.Body, int64(r.Pos)) != 0 {
         r.Pos = r.Pos + 1
     }
     n := r.Pos - start
@@ -330,7 +337,7 @@ pub fn RCStr(r: *Reader) -> string {
     if n > 0 {
         libc.memcpy(out, string(int64(r.Body) + int64(start)), n)
     }
-    out[n] = 0
+    Skink_mem_write_byte(out, int64(n), 0)
     if r.Pos < r.Len {
         r.Pos = r.Pos + 1 // skip NUL
     }
@@ -345,7 +352,7 @@ pub fn RRest(r: *Reader) -> (string, int) {
     }
     out := libc.malloc(n + 1)
     libc.memcpy(out, string(int64(r.Body) + int64(r.Pos)), n)
-    out[n] = 0
+    Skink_mem_write_byte(out, int64(n), 0)
     r.Pos = r.Len
     return out, n
 }
@@ -360,7 +367,7 @@ pub fn RBytes(r: *Reader, n: int) -> (string, int) {
     }
     out := libc.malloc(n + 1)
     libc.memcpy(out, string(int64(r.Body) + int64(r.Pos)), n)
-    out[n] = 0
+    Skink_mem_write_byte(out, int64(n), 0)
     r.Pos = r.Pos + n
     return out, n
 }

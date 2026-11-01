@@ -9,6 +9,12 @@ import "std/str"
 import "std/libc"
 import "std/testing"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // TestScalars verifies little-endian encoding.
 pub fn TestScalars() {
     b := my_pkt.NewOutBuf(16)
@@ -18,13 +24,13 @@ pub fn TestScalars() {
     my_pkt.Byte(&b, 65)
     data, n := my_pkt.Data(&b)
     testing.AssertEqualInt(15, n, "len")
-    testing.AssertEqualInt(0x34, data[0], "i16 lo")
-    testing.AssertEqualInt(0x12, data[1], "i16 hi")
-    testing.AssertEqualInt(4, data[2], "i32 b0")
-    testing.AssertEqualInt(1, data[5], "i32 b3")
-    testing.AssertEqualInt(8, data[6], "i64 b0")
-    testing.AssertEqualInt(1, data[13], "i64 b7")
-    testing.AssertEqualInt(65, data[14], "byte")
+    testing.AssertEqualInt(0x34, Skink_mem_byte(data, int64(0)), "i16 lo")
+    testing.AssertEqualInt(0x12, Skink_mem_byte(data, int64(1)), "i16 hi")
+    testing.AssertEqualInt(4, Skink_mem_byte(data, int64(2)), "i32 b0")
+    testing.AssertEqualInt(1, Skink_mem_byte(data, int64(5)), "i32 b3")
+    testing.AssertEqualInt(8, Skink_mem_byte(data, int64(6)), "i64 b0")
+    testing.AssertEqualInt(1, Skink_mem_byte(data, int64(13)), "i64 b7")
+    testing.AssertEqualInt(65, Skink_mem_byte(data, int64(14)), "byte")
     my_pkt.Free(&b)
 }
 
@@ -66,10 +72,10 @@ pub fn TestLenencNull() {
 pub fn TestLenencStr() {
     b := my_pkt.NewOutBuf(16)
     raw := libc.malloc(4)
-    raw[0] = 97
-    raw[1] = 0
-    raw[2] = 98
-    raw[3] = 0
+    Skink_mem_write_byte(raw, int64(0), 97)
+    Skink_mem_write_byte(raw, int64(1), 0)
+    Skink_mem_write_byte(raw, int64(2), 98)
+    Skink_mem_write_byte(raw, int64(3), 0)
     my_pkt.LenencStr(&b, raw, 3)
     data, n := my_pkt.Data(&b)
     testing.AssertEqualInt(4, n, "encoded")
@@ -78,9 +84,9 @@ pub fn TestLenencStr() {
     s, sn, isNull := my_pkt.RLenencStr(&r)
     testing.AssertFalse(isNull, "not null")
     testing.AssertEqualInt(3, sn, "len")
-    testing.AssertEqualInt(97, s[0], "a")
-    testing.AssertEqualInt(0, s[1], "NUL preserved")
-    testing.AssertEqualInt(98, s[2], "b")
+    testing.AssertEqualInt(97, Skink_mem_byte(s, int64(0)), "a")
+    testing.AssertEqualInt(0, Skink_mem_byte(s, int64(1)), "NUL preserved")
+    testing.AssertEqualInt(98, Skink_mem_byte(s, int64(2)), "b")
     my_pkt.Free(&b)
 }
 

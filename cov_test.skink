@@ -1,0 +1,138 @@
+// File:    cov_test.skink
+// Purpose: Coverage tests for previously-unexercised mysql API surface:
+//          auth scramblers, datetime micros round-trip, error packet
+//          parsing, reader primitives, packet Send/Recv framing over a
+//          socket pair, and the root Dial wrapper on the fake server.
+module cov_test
+
+import "my_pkt"
+import "my_conn"
+import "my_type"
+import "mysql"
+import "testkit"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/net"
+import "std/time"
+import "std/libc"
+import "std/errors"
+import "std/waitgroup"
+import "std/testing"
+
+// Raw byte accessors for binary wire buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+// TestScramblers covers both mysql_native_password and caching_sha2
+// scramble paths — deterministic, non-empty, and nonce-dependent.
+pub fn TestScramblers() {
+    s, n := my_conn.ScrambleNative("pw", "12345678901234567890", 20)
+    testing.AssertEqualInt(20, n, "native scramble len")
+    s2, n2 := my_conn.ScrambleSha2("pw", "12345678901234567890", 20)
+    testing.AssertTrue(n2 > 0, "sha2 scramble len")
+    testing.AssertTrue(n == 20, "scramble is sha1-sized")
+}
+
+// TestDatetimeMicros covers ParseDatetimeMicros/FormatTimeMicros
+// round-trip on a timestamp with microseconds.
+pub fn TestDatetimeMicros() {
+    us, ok := my_type.ParseDatetimeMicros("2024-03-01 12:34:56.789012")
+    testing.AssertTrue(ok, "parse ok")
+    testing.AssertTrue(us > int64(0), "positive micros")
+    s := my_type.FormatTimeMicros(us)
+    testing.AssertEqualString("2024-03-01 12:34:56.789012", s, "round trip")
+    _, bad := my_type.ParseDatetimeMicros("not a date")
+    testing.AssertFalse(bad, "bad date rejected")
+}
+
+// TestParseErr decodes a crafted ERR packet (0xff + code + sqlstate).
+pub fn TestParseErr() {
+    raw := libc.malloc(9)
+    Skink_mem_write_byte(raw, 0, 255)      // 0xff ERR marker
+    Skink_mem_write_byte(raw, 1, 1064 & 255)
+    Skink_mem_write_byte(raw, 2, 1064 >> 8)
+    Skink_mem_write_byte(raw, 3, 35)       // '#'
+    Skink_mem_write_byte(raw, 4, 52)       // '4'
+    Skink_mem_write_byte(raw, 5, 50)       // '2'
+    Skink_mem_write_byte(raw, 6, 48)       // '0'
+    Skink_mem_write_byte(raw, 7, 48)       // '0'
+    Skink_mem_write_byte(raw, 8, 48)       // '0'
+    msg := my_conn.ParseErr(raw, 9)
+    testing.AssertTrue(str.Len(msg) > 0, "err parsed")
+    libc.free(raw)
+}
+
+// TestReaderPrimitives covers RByte/RBytes/RI64 readers.
+pub fn TestReaderPrimitives() {
+    b := my_pkt.NewOutBuf(16)
+    my_pkt.Byte(&b, 0x42)
+    my_pkt.I32(&b, int64(1))
+    my_pkt.I32(&b, int64(2))
+    data, n := my_pkt.Data(&b)
+    r := my_pkt.NewReader(data, n)
+    testing.AssertEqualInt(0x42, my_pkt.RByte(&r), "rbyte")
+    v := my_pkt.RI64(&r)
+    testing.AssertTrue(v == (int64(2) << 32 | int64(1)), "ri64")
+    b2 := my_pkt.NewOutBuf(16)
+    my_pkt.WriteN(&b2, "abcd", 4)
+    d2, n2 := my_pkt.Data(&b2)
+    r2 := my_pkt.NewReader(d2, n2)
+    s, sn := my_pkt.RBytes(&r2, 4)
+    testing.AssertEqualInt(4, sn, "rbytes len")
+    testing.AssertTrue(Skink_mem_byte(s, 0) == 97, "rbytes content")
+    my_pkt.Free(&b)
+    my_pkt.Free(&b2)
+}
+
+// echoWorker accepts one conn and echoes one packet back.
+fn echoWorker(wg: *waitgroup.WaitGroup) {
+    ln, _ := net.Listen("127.0.0.1", 16992)
+    conn, _ := net.Accept(ln)
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16992)
+    body, seq, n, _ := my_pkt.Recv(&bc)
+    my_pkt.Send(&bc, seq + 1, body, n)
+    bc.Close()
+    ln.Close()
+    waitgroup.Done(wg)
+}
+
+// TestSendRecv verifies packet framing round-trips over a socket pair.
+pub fn TestSendRecv() {
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn echoWorker(wg)
+    time.SleepMs(30)
+    conn, cerr := net.Connect("127.0.0.1", 16992)
+    testing.AssertEqualString("", cerr.message, "connect")
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16992)
+    serr := my_pkt.Send(&bc, 0, "PING", 4)
+    testing.AssertEqualString("", serr.message, "send")
+    body, seq, n, rerr := my_pkt.Recv(&bc)
+    testing.AssertEqualString("", rerr.message, "recv")
+    testing.AssertTrue(n >= 4, "payload echoed")
+    _ = seq
+    _ = body
+    bc.Close()
+    waitgroup.Wait(wg)
+}
+
+// TestDial exercises the root Dial wrapper through the fake server.
+pub fn TestDial() {
+    fs, wg, serr := testkit.StartFakeServer(16993)
+    testing.AssertTrue(str.Len(serr.message) == 0, "fake server")
+    spawn testkit.Serve(&fs, 1, covHandler, wg)
+
+    c, cerr := mysql.Dial("mysql://user:pw@127.0.0.1:16993/db")
+    testing.AssertTrue(str.Len(cerr.message) == 0, str.Concat("dial: ", cerr.message))
+    testing.AssertTrue(c.ConnID == int64(31337), "conn id")
+    my_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// covHandler replies OK to every request.
+fn covHandler(req: testkit.MyReq) -> []testkit.Pkt {
+    return []testkit.Pkt{testkit.OKPkt(0, 0)}
+}

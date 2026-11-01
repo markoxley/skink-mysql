@@ -19,6 +19,12 @@ import "std/waitgroup"
 import "mod/markoxley/skink-dbx/dbx_bufconn"
 import "my_pkt"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // MyReq is one decoded client command handed to the responder.
 pub struct MyReq {
     Cmd:     int      // command byte (3=query, 22=prepare, 23=execute, 14=ping, 2=initdb)
@@ -46,7 +52,7 @@ fn wrap(b: *my_pkt.OutBuf) -> Pkt {
     s, n := my_pkt.Data(b)
     out := libc.malloc(n + 1)
     libc.memcpy(out, s, n)
-    out[n] = 0
+    Skink_mem_write_byte(out, int64(n), 0)
     my_pkt.Free(b)
     return Pkt{Data: out, Len: n}
 }
@@ -165,7 +171,7 @@ fn decodeCommand(body: string, n: int) -> MyReq {
     if n == 0 {
         return req
     }
-    req.Cmd = body[0]
+    req.Cmd = Skink_mem_byte(body, int64(0))
     r := my_pkt.NewReader(body, n)
     my_pkt.RByte(&r)
     if req.Cmd == 3 || req.Cmd == 22 { // QUERY / STMT_PREPARE
@@ -215,7 +221,7 @@ fn decodeExecParams(r: *my_pkt.Reader) -> []string {
     // skip type pairs
     r.Pos = r.Pos + np * 2
     for i := 0; i < np; i = i + 1 {
-        if (r.Body[bmpPos + i / 8] & (1 << (i % 8))) != 0 {
+        if (Skink_mem_byte(r.Body, int64(bmpPos + i / 8)) & (1 << (i % 8))) != 0 {
             params = append(params, "<NULL>")
         } else {
             s, _, isNull := my_pkt.RLenencStr(r)
