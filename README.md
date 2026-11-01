@@ -27,6 +27,7 @@ scales add markoxley/skink-mysql
 
 ```skink
 import "mod/markoxley/skink-mysql"
+import "mod/markoxley/skink-dbx"
 import "mod/markoxley/skink-dbx/dbx_value"
 
 fn main() {
